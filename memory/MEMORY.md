@@ -1,0 +1,1 @@
+- [Fix tty.lua:74 crash and boot loop](feedback_tty_crash.md) — Fixed tty.lua assert crash, added proper sleep timing, and prevented infinite boot loops
