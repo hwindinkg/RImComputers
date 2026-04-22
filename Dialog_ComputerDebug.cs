@@ -55,7 +55,7 @@ namespace RimComputers
             lock (comp.DebugLog) logCount = comp.DebugLog.Count;
             Widgets.Label(new Rect(inRect.x, y, inRect.width, 18f),
                 $"State: {comp.State}   Lua: {comp.LuaVerString}   " +
-                $"RAM: {comp.RamUsed / 1024}KB / {comp.Props.RamMB:F0}MB   " +
+                $"RAM: {comp.RamUsed / 1024}KB / {comp.EffectiveRamMB:0.#}MB   " +
                 $"ROM: {comp.RomUsed / 1024}KB / {comp.Props.RomMB:F0}MB   " +
                 $"Log entries: {logCount}");
             y += 22f;

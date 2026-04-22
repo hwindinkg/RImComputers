@@ -4,7 +4,9 @@
       "Bash(dir:*)",
       "Bash(unzip -l \"D:\\\\SteamLibrary\\\\steamapps\\\\common\\\\RimWorld\\\\Mods\\\\RimComputers\\\\Source\\\\RimComputers\\\\RimComputers.zip\")",
       "Bash(findstr /i rom)",
-      "Bash(findstr -i \"\\\\.lua\")"
+      "Bash(findstr -i \"\\\\.lua\")",
+      "Bash(csc:*)",
+      "Bash(find D:SteamLibrarysteamappscommonRimWorldModsRimComputersSourceRimComputers -name \"OCApi.cs\" -exec grep -n \"^}\" {} +)"
     ]
   }
 }

@@ -86,6 +86,13 @@ namespace RimComputers
         // Internet card state (toggled via gizmo)
         private volatile bool internetEnabled = false;
 
+        // Per-computer BIOS code
+        private string _biosCode;
+        public string BiosCode { get => _biosCode; set => _biosCode = value ?? ""; }
+
+        // Eeprom user data (arbitrary storage for Lua programs)
+        private string _eepromUserData = "";
+
         // State
         // (eepromData removed — BIOS code is now stored in _biosCode)
         private string bootAddress;   // which filesystem component to boot from
@@ -126,6 +133,13 @@ namespace RimComputers
         public long RamUsed => ramUsed;
         public long RomUsed => romUsed;
 
+        // Effective RAM exposed to the Lua VM. Usually equals props.ramBytes,
+        // but Comp_Computer passes a tier-multiplied override so the amount of
+        // memory reported via computer.totalMemory()/freeMemory() matches the
+        // gizmo label (e.g. 5 MB at T1, 10 MB at T2, 20 MB at T3).
+        private long effectiveRamBytes;
+        public long EffectiveRamBytes => effectiveRamBytes;
+
         private sealed class FileHandle
         {
             public string Path;
@@ -158,34 +172,9 @@ namespace RimComputers
                      List<string> log, Thing building,
                      string hddFolderPath = null,
                      Dictionary<string, byte[]> legacyVfsMigration = null,
-                     Comp_Computer compComp = null)
-        {
-            LoadNativeLua();
-
-            this.lua = new Lua();
-            this.screen = screen;
-            this.props = props;
-            this.log = log;
-            this.building = building;
-            this.compComp = compComp;
-            this.hddFolderPath = hddFolderPath;
-
-            lua.UseTraceback = true;
-
-            // ── Per-computer BIOS code ────────────────────────────────────────────
-        // Loaded from ROM/BIOS/bios.lua on first boot; can be reflashed by flash.lua.
-        private string _biosCode;
-        public  string BiosCode { get => _biosCode; set => _biosCode = value ?? ""; }
-
-        // Eeprom user data (arbitrary storage for Lua programs)
-        private string _eepromUserData = "";
-
-        public OCApi(ScreenBuffer screen, CompProperties_Computer props,
-                     List<string> log, Thing building,
-                     string hddFolderPath = null,
-                     Dictionary<string, byte[]> legacyVfsMigration = null,
                      string savedBiosCode = null,
-                     Comp_Computer compComp = null)
+                     Comp_Computer compComp = null,
+                     long ramBytesOverride = 0L)
         {
             LoadNativeLua();
 
@@ -196,6 +185,7 @@ namespace RimComputers
             this.building = building;
             this.compComp = compComp;
             this.hddFolderPath = hddFolderPath;
+            this.effectiveRamBytes = ramBytesOverride > 0 ? ramBytesOverride : props.ramBytes;
 
             lua.UseTraceback = true;
 
@@ -386,8 +376,8 @@ end
             lua["computer.address"] = new Func<string>(() => compAddr);
             // tmpAddress ДОЛЖНА быть функцией — OpenOS вызывает computer.tmpAddress()
             lua["computer.tmpAddress"] = (Func<string>)(() => fsAddr);
-            lua["computer.totalMemory"] = (Func<long>)(() => props.ramBytes);
-            lua["computer.freeMemory"] = (Func<long>)(() => props.ramBytes - ramUsed);
+            lua["computer.totalMemory"] = (Func<long>)(() => effectiveRamBytes);
+            lua["computer.freeMemory"] = (Func<long>)(() => effectiveRamBytes - ramUsed);
             lua["computer.uptime"] = (Func<double>)(() => (double)uptimeSeconds);
             lua["computer.energy"] = (Func<double>)(() => 100.0);
             lua["computer.maxEnergy"] = (Func<double>)(() => 100.0);
@@ -953,8 +943,8 @@ end
             {
                 case "address": return new object[] { compAddr };
                 case "tmpAddress": return new object[] { fsAddr };
-                case "freeMemory": return new object[] { (double)(props.ramBytes - ramUsed) };
-                case "totalMemory": return new object[] { (double)props.ramBytes };
+                case "freeMemory": return new object[] { (double)(effectiveRamBytes - ramUsed) };
+                case "totalMemory": return new object[] { (double)effectiveRamBytes };
                 case "uptime": return new object[] { (double)uptimeSeconds };
                 case "energy": return new object[] { 100.0 };
                 case "maxEnergy": return new object[] { 100.0 };

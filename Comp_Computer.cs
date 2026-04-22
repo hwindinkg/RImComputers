@@ -23,11 +23,15 @@ namespace RimComputers
 
         // Labels shown in gizmo
         public string CpuLabel  => $"CPU T{cpuTier}";
-        public string RamLabel  => $"RAM T{ramTier} ({RamMB}MB)";
         public string GpuLabel  => $"GPU T{gpuTier} ({GpuWidth}×{GpuHeight})";
         public string HddLabel  => $"HDD ×{hddCount} ({HddCapMB}MB each)";
 
-        public int RamMB      => cpuTier  == 3 ? 192 : cpuTier  == 2 ? 64 : 16;
+        // RAM tier acts as a multiplier on top of the base ramBytes declared on
+        // CompProperties_Computer (the physical memory fitted to the machine).
+        // T1 = 1×, T2 = 2×, T3 = 4×. Actual MB is derived in Comp_Computer where
+        // CompProperties are accessible; see Comp_Computer.EffectiveRamBytes.
+        public int RamMultiplier => ramTier == 3 ? 4 : ramTier == 2 ? 2 : 1;
+
         public int GpuWidth   => gpuTier  == 3 ? 160 : gpuTier  == 2 ? 80 : 50;
         public int GpuHeight  => gpuTier  == 3 ?  50 : gpuTier  == 2 ? 25 : 16;
         public int HddCapMB   => hddCount == 3 ?   4 : hddCount == 2 ?  2 :  1;
@@ -87,6 +91,11 @@ namespace RimComputers
         public long RamUsed  => ocApi?.RamUsed  ?? 0L;
         public long RomUsed  => ocApi?.RomUsed  ?? 0L;
         public string LuaVerString => "NLua/5.3";
+
+        // Actual RAM available to the Lua VM: base memory from Def × RAM-tier multiplier.
+        public long  EffectiveRamBytes => Props.ramBytes * Hardware.RamMultiplier;
+        public float EffectiveRamMB    => EffectiveRamBytes / 1048576f;
+        public string RamLabel         => $"RAM T{Hardware.ramTier} ({EffectiveRamMB:0.#}MB)";
 
         // ── HDD folder on real disk ──────────────────────────────────────────
         public string HddFolderPath =>
@@ -164,7 +173,7 @@ namespace RimComputers
             bootTicksLeft = BootTicks;
             screen.Clear();
             screen.Println("RimComputers BIOS");
-            screen.Println($"CPU: T{Hardware.cpuTier}  RAM: {Hardware.RamMB}MB  GPU: T{Hardware.gpuTier}");
+            screen.Println($"CPU: T{Hardware.cpuTier}  RAM: {EffectiveRamMB:0.#}MB  GPU: T{Hardware.gpuTier}");
             screen.Println("Booting...");
             Log("Boot started");
         }
@@ -217,7 +226,8 @@ namespace RimComputers
                     hddFolderPath:     HddFolderPath,
                     legacyVfsMigration: legacyMigration,
                     savedBiosCode:     _savedBiosCode,
-                    compComp:          this);
+                    compComp:          this,
+                    ramBytesOverride:  EffectiveRamBytes);
 
                 if (internetEnabled) ocApi.SetInternetEnabled(true);
 
@@ -343,7 +353,7 @@ namespace RimComputers
             catch { }
 
             return $"State: {state}  BIOS: {(_savedBiosCode != null ? "custom" : "default")}\n" +
-                   $"{Hardware.CpuLabel}  {Hardware.RamLabel}  {Hardware.GpuLabel}\n" +
+                   $"{Hardware.CpuLabel}  {RamLabel}  {Hardware.GpuLabel}\n" +
                    $"HDD: {hddFiles} files  Net: {(internetEnabled ? "ON" : "OFF")}";
         }
 
@@ -411,8 +421,8 @@ namespace RimComputers
                 ref hw.cpuTier, 1, 3, comp.State == ComputerState.Off);
 
             // ── RAM ───────────────────────────────────────────────────────────
-            DrawComponentSlot(ref y, inRect, "RAM", hw.RamLabel,
-                $"Tier {hw.ramTier} · {hw.RamMB} MB addressable",
+            DrawComponentSlot(ref y, inRect, "RAM", comp.RamLabel,
+                $"Tier {hw.ramTier} · {comp.EffectiveRamMB:0.#} MB addressable",
                 ref hw.ramTier, 1, 3, comp.State == ComputerState.Off);
 
             // ── GPU ───────────────────────────────────────────────────────────
