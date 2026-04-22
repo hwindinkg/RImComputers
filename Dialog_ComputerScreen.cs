@@ -297,6 +297,7 @@ namespace RimComputers
                 newW = Mathf.Clamp(newW, 300f, UI.screenWidth  - 40f);
                 newH = Mathf.Clamp(newH, 200f, UI.screenHeight - 60f);
                 windowRect = new Rect(windowRect.x, windowRect.y, newW, newH);
+                cellStyle = null; // force font size recalculation
             }
 
             float y = inRect.y;
@@ -337,6 +338,10 @@ namespace RimComputers
             Text.Font   = GameFont.Small;
         }
 
+        private Font    cellFont;
+        private int     cellFontSize = 13;
+        private bool    _fontRequested = false;
+
         private void DrawScreen(Rect area)
         {
             var buf = comp.Screen;
@@ -345,6 +350,37 @@ namespace RimComputers
             float cw = area.width  / buf.Width;
             float ch = area.height / buf.Height;
 
+            EnsureCellStyle();
+
+            // ── Pre-request ALL on-screen characters before rendering ──────────
+            // Unity dynamic fonts populate glyphs asynchronously. We must call
+            // RequestCharactersInTexture BEFORE GUI.Label, otherwise Unicode chars
+            // (box-drawing ╔ ║ ═, arrows ← ↑ →, Cyrillic, etc.) show as ?.
+            // We request on EVERY Layout event so newly-appeared chars are covered.
+            if (cellFont != null && Event.current.type == EventType.Layout)
+            {
+                var sb = new System.Text.StringBuilder(buf.Width * buf.Height);
+                for (int row = 0; row < buf.Height; row++)
+                    for (int col = 0; col < buf.Width; col++)
+                    {
+                        string c = buf.GetChar(col, row);
+                        if (!string.IsNullOrEmpty(c) && c != " ") sb.Append(c);
+                    }
+                if (sb.Length > 0)
+                    cellFont.RequestCharactersInTexture(sb.ToString(), cellFontSize, FontStyle.Normal);
+
+                // Also request on first frame to pre-warm the font atlas
+                if (!_fontRequested)
+                {
+                    _fontRequested = true;
+                    cellFont.RequestCharactersInTexture(BoxDrawingPreload, cellFontSize, FontStyle.Normal);
+                }
+
+                // Rebuild style to pick up any atlas changes
+                if (cellStyle != null) cellStyle.font = cellFont;
+            }
+
+            // ── Render cells ──────────────────────────────────────────────────
             Text.Font   = GameFont.Tiny;
             Text.Anchor = TextAnchor.UpperLeft;
 
@@ -356,12 +392,14 @@ namespace RimComputers
                     Color32 fgColor = buf.GetFG(col, row);
                     string  cell    = buf.GetChar(col, row);
 
+                    float px = area.x + col * cw;
+                    float py = area.y + row * ch;
+
                     bool isEmpty = (cell == " " || cell == "\0" || string.IsNullOrEmpty(cell))
                                    && bgColor.r == 0 && bgColor.g == 0 && bgColor.b == 0;
 
                     if (!isEmpty)
-                        Widgets.DrawBoxSolid(
-                            new Rect(area.x + col * cw, area.y + row * ch, cw + 0.5f, ch + 0.5f),
+                        Widgets.DrawBoxSolid(new Rect(px, py, cw + 0.5f, ch + 0.5f),
                             new Color(bgColor.r / 255f, bgColor.g / 255f, bgColor.b / 255f));
 
                     if (string.IsNullOrEmpty(cell) || cell == " ") continue;
@@ -369,42 +407,63 @@ namespace RimComputers
                     cellStyle.normal.textColor =
                         new Color(fgColor.r / 255f, fgColor.g / 255f, fgColor.b / 255f);
 
-                    GUI.Label(
-                        new Rect(area.x + col * cw, area.y + row * ch, cw + 2f, ch + 1f),
-                        cell, cellStyle);
+                    GUI.Label(new Rect(px, py, cw + 2f, ch + 1f), cell, cellStyle);
                 }
             }
 
             Text.Anchor = TextAnchor.UpperLeft;
         }
 
+        // Characters to pre-warm in the font atlas on first frame
+        private static readonly string BoxDrawingPreload = BuildPreloadString();
+        private static string BuildPreloadString()
+        {
+            var sb = new System.Text.StringBuilder();
+            // ASCII printable
+            for (int i = 0x20; i <= 0x7E; i++) sb.Append((char)i);
+            // Box Drawing U+2500–U+257F
+            for (int i = 0x2500; i <= 0x257F; i++) sb.Append(char.ConvertFromUtf32(i));
+            // Block Elements U+2580–U+259F
+            for (int i = 0x2580; i <= 0x259F; i++) sb.Append(char.ConvertFromUtf32(i));
+            // Arrows U+2190–U+21FF
+            for (int i = 0x2190; i <= 0x21FF; i++) sb.Append(char.ConvertFromUtf32(i));
+            // Cyrillic U+0400–U+04FF
+            for (int i = 0x0400; i <= 0x04FF; i++) sb.Append(char.ConvertFromUtf32(i));
+            // Latin Extended U+00C0–U+024F
+            for (int i = 0x00C0; i <= 0x024F; i++) sb.Append(char.ConvertFromUtf32(i));
+            // Geometric shapes U+25A0–U+25FF
+            for (int i = 0x25A0; i <= 0x25FF; i++) sb.Append(char.ConvertFromUtf32(i));
+            return sb.ToString();
+        }
+
         private void EnsureCellStyle()
         {
-            if (cellStyle != null) return;
+            if (cellStyle != null && cellFont != null) return;
 
-            // Try to find a monospace font that has box-drawing characters.
-            // Unity's Font.CreateDynamicFontFromOSFont searches the OS font library.
-            // Priority: Consolas (Windows, has full box-drawing), DejaVu Sans Mono (Linux/Mac),
-            // then various fallbacks. Arial Unicode MS has the widest glyph coverage.
-            Font monoFont = null;
-            string[] candidates = new[]
+            cellFontSize = Mathf.RoundToInt(
+                Mathf.Clamp(windowRect.height / (comp.Screen?.Height ?? 50) * 0.85f, 8f, 20f));
+
+            // Find a monospace font with Unicode support.
+            // Consolas (Windows) has full box-drawing coverage.
+            // DejaVu Sans Mono is excellent on Linux/macOS.
+            // Arial Unicode MS has the broadest glyph coverage.
+            if (cellFont == null)
             {
-                "Consolas",
-                "Courier New",
-                "DejaVu Sans Mono",
-                "Liberation Mono",
-                "Lucida Console",
-                "Arial Unicode MS",
-                "Arial",
-            };
-            foreach (string fname in candidates)
-            {
-                try
+                string[] fontCandidates =
                 {
-                    var f = Font.CreateDynamicFontFromOSFont(fname, 14);
-                    if (f != null) { monoFont = f; break; }
+                    "Consolas", "Courier New", "DejaVu Sans Mono",
+                    "Lucida Console", "Liberation Mono",
+                    "Arial Unicode MS", "Arial",
+                };
+                foreach (string fname in fontCandidates)
+                {
+                    try
+                    {
+                        var f = Font.CreateDynamicFontFromOSFont(fname, cellFontSize);
+                        if (f != null) { cellFont = f; break; }
+                    }
+                    catch { }
                 }
-                catch { }
             }
 
             cellStyle = new GUIStyle(GUI.skin.label)
@@ -414,24 +473,11 @@ namespace RimComputers
                 padding   = new RectOffset(0, 0, 0, 0),
                 margin    = new RectOffset(0, 0, 0, 0),
                 richText  = false,
-                font      = monoFont,
+                font      = cellFont,
+                fontSize  = cellFontSize,
             };
             cellStyle.normal.textColor = Color.white;
-
-            // Request that the font pre-caches box-drawing and common Unicode blocks
-            // so they render correctly on first draw.
-            if (monoFont != null)
-            {
-                try
-                {
-                    // Box-drawing: U+2500-U+257F, Arrows: U+2190-U+21FF
-                    var sb = new System.Text.StringBuilder();
-                    for (int cp = 0x2500; cp <= 0x257F; cp++) sb.Append(char.ConvertFromUtf32(cp));
-                    for (int cp = 0x2190; cp <= 0x21FF; cp++) sb.Append(char.ConvertFromUtf32(cp));
-                    monoFont.RequestCharactersInTexture(sb.ToString(), 14);
-                }
-                catch { }
-            }
+            _fontRequested = false; // will trigger pre-warm on next Layout
         }
     }
 }

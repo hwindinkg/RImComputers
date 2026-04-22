@@ -87,7 +87,7 @@ namespace RimComputers
         private volatile bool internetEnabled = false;
 
         // State
-        private string eepromData;    // what eeprom.getData() returns
+        // (eepromData removed — BIOS code is now stored in _biosCode)
         private string bootAddress;   // which filesystem component to boot from
         private volatile bool running = true;
         public bool IsRunning => running;
@@ -172,6 +172,33 @@ namespace RimComputers
 
             lua.UseTraceback = true;
 
+            // ── Per-computer BIOS code ────────────────────────────────────────────
+        // Loaded from ROM/BIOS/bios.lua on first boot; can be reflashed by flash.lua.
+        private string _biosCode;
+        public  string BiosCode { get => _biosCode; set => _biosCode = value ?? ""; }
+
+        // Eeprom user data (arbitrary storage for Lua programs)
+        private string _eepromUserData = "";
+
+        public OCApi(ScreenBuffer screen, CompProperties_Computer props,
+                     List<string> log, Thing building,
+                     string hddFolderPath = null,
+                     Dictionary<string, byte[]> legacyVfsMigration = null,
+                     string savedBiosCode = null,
+                     Comp_Computer compComp = null)
+        {
+            LoadNativeLua();
+
+            this.lua = new Lua();
+            this.screen = screen;
+            this.props = props;
+            this.log = log;
+            this.building = building;
+            this.compComp = compComp;
+            this.hddFolderPath = hddFolderPath;
+
+            lua.UseTraceback = true;
+
             string baseId = building?.ThingID ?? Guid.NewGuid().ToString("N");
             gpuAddr    = DeterministicGuid(baseId, "gpu");
             scrnAddr   = DeterministicGuid(baseId, "screen");
@@ -181,10 +208,17 @@ namespace RimComputers
             compAddr   = DeterministicGuid(baseId, "computer");
             kbdAddr    = DeterministicGuid(baseId, "keyboard");
 
-            // ── ROM floppy (read-only) ────────────────────────────────────────
-            foreach (var e in RomLoader.Load(romVfs)) log.Add(e);
+            // ── ROM floppy (read-only OS disk) ────────────────────────────────
+            string defaultBios;
+            foreach (var e in RomLoader.Load(romVfs, out defaultBios)) log.Add(e);
             foreach (var k in romVfs.Keys)  romKeys.Add(k);
             foreach (var v in romVfs.Values) romUsed += v.LongLength;
+
+            // ── Per-computer BIOS ─────────────────────────────────────────────
+            // Use saved BIOS if this computer was previously flashed; else default.
+            _biosCode = !string.IsNullOrEmpty(savedBiosCode)
+                ? savedBiosCode
+                : defaultBios ?? RomLoader.BuiltinBiosStub;
 
             // ── HDD (writable, persisted to folder) ──────────────────────────
             if (!string.IsNullOrEmpty(hddFolderPath) && Directory.Exists(hddFolderPath))
@@ -205,7 +239,6 @@ namespace RimComputers
             bool hddHasOs = hddVfs.ContainsKey("init.lua") || hddVfs.ContainsKey("bios.lua")
                          || hddVfs.ContainsKey("boot/01_process.lua");
             bootAddress = hddHasOs ? hddAddr : romAddr;
-            eepromData  = bootAddress;
 
             foreach (var d in new[] { "bin","lib","etc","tmp","home","mnt","usr","boot","lib/core" })
                 EnsureDir(d, hddVfs);
@@ -213,6 +246,7 @@ namespace RimComputers
                 WriteText("etc/hostname", "rimcomp-" + hddAddr.Substring(0,8) + "\n", hddVfs);
 
             Log($"[OCApi] ROM={romVfs.Count} files ({romUsed/1024}KB)  HDD={hddVfs.Count} files  boot={bootAddress.Substring(0,8)}...");
+            Log($"[OCApi] BIOS {_biosCode.Length}B ({(savedBiosCode != null ? "custom/flashed" : "default")})");
 
             RegisterAll();
 
@@ -383,12 +417,11 @@ end
             });
 
             // getBootAddress / setBootAddress
-            lua["computer.getBootAddress"] = (Func<string>)(() => bootAddress ?? fsAddr);
+            lua["computer.getBootAddress"] = (Func<string>)(() => bootAddress ?? hddAddr);
             lua["computer.setBootAddress"] = (Action<object>)(addr =>
             {
-                bootAddress = addr?.ToString() ?? fsAddr;
-                eepromData = bootAddress;
-                Log($"[computer] setBootAddress={bootAddress}");
+                bootAddress = addr?.ToString() ?? bootAddress;
+                Log($"[computer] setBootAddress={bootAddress?.Substring(0, Math.Min(8, bootAddress?.Length ?? 0))}...");
             });
 
             // pushSignal — NLua cannot match (string, object[]) when Lua passes individual
@@ -1388,7 +1421,18 @@ end
                 case "write":        return new object[] { FsWrite(Int(0), Str(1), targetVfs) };
                 case "seek":         return new object[] { FsSeek(Int(0), Str(1), Int(2), merged) };
                 case "makeDirectory":
-                    if (readOnly) return new object[] { null, "filesystem is read-only" };
+                    if (readOnly)
+                    {
+                        // Allow ephemeral directory creation on ROM.
+                        // OpenOS boot/90_filesystem.lua calls makeDirectory("/mnt/<addr>/")
+                        // on the ROOT (ROM) filesystem to create mount points.
+                        // Real OC ROM is read-only for files but allows mkdir in RAM;
+                        // we replicate that by adding to romVfs (cleared each reboot
+                        // since each boot creates a new OCApi instance).
+                        EnsureDir(Str(0), romVfs);
+                        InvalidateMergedVfs();
+                        return new object[] { true };
+                    }
                     EnsureDir(Str(0), targetVfs); InvalidateMergedVfs();
                     return new object[] { true };
                 case "remove":
@@ -1551,18 +1595,45 @@ end
             string Str(int i) => i < args.Length ? args[i]?.ToString() ?? "" : "";
             switch (method)
             {
-                case "get": return new object[] { eepromData ?? "" };
-                case "set": eepromData = Str(0); return new object[] { true };
-                case "getData": return new object[] { eepromData ?? fsAddr };
+                // getData / get: returns the current BIOS Lua code (what flash.lua reads)
+                case "getData":
+                case "get":
+                    return new object[] { _biosCode ?? "" };
+
+                // setData / set: flashes new BIOS code (persisted via Comp_Computer save)
                 case "setData":
-                    eepromData = args.Length > 0 ? Str(0) : null;
-                    bootAddress = eepromData ?? fsAddr;
+                case "set":
+                {
+                    string newCode = args.Length > 0 ? Str(0) : "";
+                    _biosCode = newCode;
+                    // Notify Comp_Computer so it persists the new code in the save game
+                    compComp?.OnBiosFlashed(newCode);
+                    Log($"[eeprom] BIOS reflashed ({newCode.Length} bytes)");
                     return new object[] { true };
-                case "getLabel": return new object[] { "BIOS" };
-                case "getSize": return new object[] { 4096 };
-                case "getChecksum": return new object[] { "opencomputers" };
+                }
+
+                // Boot address: used by OC BIOS to set which filesystem to boot next
+                case "getBootAddress": return new object[] { bootAddress };
+                case "setBootAddress":
+                    if (args.Length > 0 && args[0] is string addr)
+                        bootAddress = addr;
+                    return new object[] { true };
+
+                case "getLabel":    return new object[] { "BIOS" };
+                case "setLabel":    return new object[] { true };
+                case "getSize":     return new object[] { (double)65536 }; // 64KB eeprom
+                case "getChecksum": return new object[] { ComputeChecksum(_biosCode) };
+                case "makeReadonly":return new object[] { false }; // not locked
                 default: return new object[] { null };
             }
+        }
+
+        private static string ComputeChecksum(string code)
+        {
+            if (string.IsNullOrEmpty(code)) return "00000000";
+            uint h = 0;
+            foreach (char c in code) { h ^= (uint)c; h = (h << 5) | (h >> 27); }
+            return h.ToString("x8");
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1768,21 +1839,17 @@ end
         {
             Log("[boot] Starting BIOS...");
 
-            // Clear the C# screen buffer so any BIOS splash text (printed during
-            // the boot countdown in Comp_Computer) is gone before the BIOS runs.
-            // Without this, "RimComputers BIOS v1.0 / Booting..." stays visible
-            // in areas the BIOS code doesn't redraw.
+            // Clear the C# screen buffer so any C#-side splash is gone before BIOS draws.
             screen.Clear();
 
-            var merged = BuildMergedVfs();
-            if (!merged.ContainsKey("bios.lua"))
+            string biosCode = _biosCode;
+            if (string.IsNullOrEmpty(biosCode))
             {
-                Log("[boot] ERROR: bios.lua not found in VFS!");
+                Log("[boot] ERROR: BIOS code is empty!");
                 screen.Println("ERROR: No BIOS found!");
                 return;
             }
 
-            string biosCode = Encoding.UTF8.GetString(merged["bios.lua"]);
             Log($"[boot] BIOS size: {biosCode.Length} bytes");
             Log("[boot] Compiling BIOS...");
 
