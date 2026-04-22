@@ -443,26 +443,50 @@ namespace RimComputers
             cellFontSize = Mathf.RoundToInt(
                 Mathf.Clamp(windowRect.height / (comp.Screen?.Height ?? 50) * 0.85f, 8f, 20f));
 
-            // Find a monospace font with Unicode support.
-            // Consolas (Windows) has full box-drawing coverage.
-            // DejaVu Sans Mono is excellent on Linux/macOS.
-            // Arial Unicode MS has the broadest glyph coverage.
+            // Build a single font with a fallback chain so characters missing
+            // from the primary face (e.g. Cyrillic, box-drawing, arrows) are
+            // rendered from the next-best OS font instead of showing as "?".
+            //
+            // Unity's `Font.CreateDynamicFontFromOSFont(string[] names, int)`
+            // constructs a font backed by all named OS fonts — the first one
+            // is primary, the rest are fallbacks. This is essential on
+            // Windows where Consolas lacks some glyphs that "Segoe UI Symbol"
+            // / "Lucida Sans Unicode" / "Arial Unicode MS" cover.
             if (cellFont == null)
             {
                 string[] fontCandidates =
                 {
-                    "Consolas", "Courier New", "DejaVu Sans Mono",
-                    "Lucida Console", "Liberation Mono",
-                    "Arial Unicode MS", "Arial",
+                    // Monospace primaries
+                    "Consolas", "Cascadia Mono", "Courier New", "Lucida Console",
+                    "DejaVu Sans Mono", "Liberation Mono", "Menlo", "Monaco",
+                    // Broad Unicode / box-drawing fallbacks
+                    "Segoe UI Symbol", "Segoe UI", "Lucida Sans Unicode",
+                    "Arial Unicode MS", "Noto Sans Mono", "Noto Sans",
+                    "DejaVu Sans", "Arial",
                 };
-                foreach (string fname in fontCandidates)
+
+                try
                 {
-                    try
+                    // Primary + fallbacks in one font object (Unity picks
+                    // glyphs from the first font that has them).
+                    cellFont = Font.CreateDynamicFontFromOSFont(
+                        fontCandidates, cellFontSize);
+                }
+                catch { cellFont = null; }
+
+                // Fallback: try them one by one if the multi-font overload
+                // isn't available or returned null.
+                if (cellFont == null)
+                {
+                    foreach (string fname in fontCandidates)
                     {
-                        var f = Font.CreateDynamicFontFromOSFont(fname, cellFontSize);
-                        if (f != null) { cellFont = f; break; }
+                        try
+                        {
+                            var f = Font.CreateDynamicFontFromOSFont(fname, cellFontSize);
+                            if (f != null) { cellFont = f; break; }
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
             }
 
@@ -478,6 +502,19 @@ namespace RimComputers
             };
             cellStyle.normal.textColor = Color.white;
             _fontRequested = false; // will trigger pre-warm on next Layout
+
+            // Pre-warm the glyph atlas synchronously so the very first frame
+            // doesn't render "?" for glyphs the font *does* have but hasn't
+            // rasterised yet. Unity populates dynamic-font atlases lazily.
+            if (cellFont != null)
+            {
+                try
+                {
+                    cellFont.RequestCharactersInTexture(
+                        BoxDrawingPreload, cellFontSize, FontStyle.Normal);
+                }
+                catch { }
+            }
         }
     }
 }

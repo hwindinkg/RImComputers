@@ -66,6 +66,12 @@ namespace RimComputers
         // null → use ROM/BIOS/bios.lua default on next boot
         internal string _savedBiosCode = null;
 
+        // ── Per-computer EEPROM user data (serialised; 256 B max) ────────────
+        // Stores e.g. the boot-filesystem UUID that OpenOS writes via
+        // computer.setBootAddress(). Kept SEPARATE from _savedBiosCode so that
+        // writing the boot UUID does not corrupt the BIOS.
+        internal string _savedEepromData = null;
+
         // ── Internet card ────────────────────────────────────────────────────
         private bool internetEnabled = false;
 
@@ -73,8 +79,13 @@ namespace RimComputers
         private Dictionary<string, string> persistentVfsB64 = new Dictionary<string, string>();
 
         // ── Boot timing ──────────────────────────────────────────────────────
+        // Tier-dependent: a T1 CPU is slow to POST. RimWorld runs at 60 TPS on
+        // 1× speed, so these map to ~4 s / 3 s / 2 s of real time on normal
+        // speed. Previously a flat 60 ticks (~1 s) which felt instant at 3×/6×.
         private int bootTicksLeft;
-        private const int BootTicks = 60;
+        private int BootTicks =>
+            Hardware?.cpuTier == 3 ? 120 :
+            Hardware?.cpuTier == 2 ? 180 : 240;
 
         // ── Reboot / shutdown flags ──────────────────────────────────────────
         private volatile bool _pendingReboot;
@@ -161,6 +172,14 @@ namespace RimComputers
             Log($"[BIOS] Flashed {newBiosCode?.Length ?? 0} bytes — will take effect on next reboot");
         }
 
+        // Called from OCApi when eeprom.setData is invoked (e.g. OpenOS storing
+        // the boot-filesystem UUID). Persisted to the save game so it survives
+        // reboots — this is what `computer.setBootAddress(addr)` relies on.
+        public void OnEepromDataChanged(string newData)
+        {
+            _savedEepromData = newData;
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // Power on / off
         // ════════════════════════════════════════════════════════════════════
@@ -227,7 +246,8 @@ namespace RimComputers
                     legacyVfsMigration: legacyMigration,
                     savedBiosCode:     _savedBiosCode,
                     compComp:          this,
-                    ramBytesOverride:  EffectiveRamBytes);
+                    ramBytesOverride:  EffectiveRamBytes,
+                    savedEepromData:   _savedEepromData);
 
                 if (internetEnabled) ocApi.SetInternetEnabled(true);
 
@@ -367,6 +387,7 @@ namespace RimComputers
             Scribe_Values.Look(ref state,           "rcState",           ComputerState.Off);
             Scribe_Values.Look(ref internetEnabled, "rcInternetEnabled", false);
             Scribe_Values.Look(ref _savedBiosCode,  "rcBiosCode",        null);
+            Scribe_Values.Look(ref _savedEepromData,"rcEepromData",      null);
 
             Scribe_Deep.Look(ref Hardware, "rcHardware");
             if (Hardware == null) Hardware = new ComputerHardware();

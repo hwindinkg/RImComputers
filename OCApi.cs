@@ -86,12 +86,22 @@ namespace RimComputers
         // Internet card state (toggled via gizmo)
         private volatile bool internetEnabled = false;
 
-        // Per-computer BIOS code
+        // Per-computer BIOS code (eeprom.get / eeprom.set — ~4 KB Lua source).
         private string _biosCode;
         public string BiosCode { get => _biosCode; set => _biosCode = value ?? ""; }
 
-        // Eeprom user data (arbitrary storage for Lua programs)
+        // EEPROM user data (eeprom.getData / eeprom.setData — max 256 B in OC).
+        // Used by OpenOS to store the boot-filesystem UUID. This is SEPARATE
+        // from the BIOS code; conflating the two (as a previous version did)
+        // causes the BIOS to be overwritten with a UUID the first time OpenOS
+        // runs `computer.setBootAddress`, which breaks subsequent reboots and
+        // halfway-through installers such as MineOS.
         private string _eepromUserData = "";
+        public string EepromUserData
+        {
+            get => _eepromUserData ?? "";
+            set => _eepromUserData = value ?? "";
+        }
 
         // State
         // (eepromData removed — BIOS code is now stored in _biosCode)
@@ -174,7 +184,8 @@ namespace RimComputers
                      Dictionary<string, byte[]> legacyVfsMigration = null,
                      string savedBiosCode = null,
                      Comp_Computer compComp = null,
-                     long ramBytesOverride = 0L)
+                     long ramBytesOverride = 0L,
+                     string savedEepromData = null)
         {
             LoadNativeLua();
 
@@ -186,6 +197,7 @@ namespace RimComputers
             this.compComp = compComp;
             this.hddFolderPath = hddFolderPath;
             this.effectiveRamBytes = ramBytesOverride > 0 ? ramBytesOverride : props.ramBytes;
+            this._eepromUserData   = savedEepromData ?? "";
 
             lua.UseTraceback = true;
 
@@ -1585,13 +1597,9 @@ end
             string Str(int i) => i < args.Length ? args[i]?.ToString() ?? "" : "";
             switch (method)
             {
-                // getData / get: returns the current BIOS Lua code (what flash.lua reads)
-                case "getData":
+                // get / set — BIOS Lua source code (~4 KB).
                 case "get":
                     return new object[] { _biosCode ?? "" };
-
-                // setData / set: flashes new BIOS code (persisted via Comp_Computer save)
-                case "setData":
                 case "set":
                 {
                     string newCode = args.Length > 0 ? Str(0) : "";
@@ -1599,6 +1607,21 @@ end
                     // Notify Comp_Computer so it persists the new code in the save game
                     compComp?.OnBiosFlashed(newCode);
                     Log($"[eeprom] BIOS reflashed ({newCode.Length} bytes)");
+                    return new object[] { true };
+                }
+
+                // getData / setData — small user data slot (256 B in OC).
+                // OpenOS stores the boot-filesystem UUID here via
+                // computer.setBootAddress(). Must NOT touch the BIOS code.
+                case "getData":
+                    return new object[] { _eepromUserData ?? "" };
+                case "setData":
+                {
+                    string newData = args.Length > 0 ? Str(0) : "";
+                    if (newData.Length > 256) newData = newData.Substring(0, 256);
+                    _eepromUserData = newData;
+                    compComp?.OnEepromDataChanged(newData);
+                    Log($"[eeprom] data written ({newData.Length} bytes)");
                     return new object[] { true };
                 }
 
@@ -1611,7 +1634,8 @@ end
 
                 case "getLabel":    return new object[] { "BIOS" };
                 case "setLabel":    return new object[] { true };
-                case "getSize":     return new object[] { (double)65536 }; // 64KB eeprom
+                case "getSize":     return new object[] { (double)4096 };  // BIOS code capacity
+                case "getDataSize": return new object[] { (double)256 };   // user-data capacity
                 case "getChecksum": return new object[] { ComputeChecksum(_biosCode) };
                 case "makeReadonly":return new object[] { false }; // not locked
                 default: return new object[] { null };
@@ -1822,6 +1846,70 @@ end
         // LuaPushSignal removed — pushSignal now uses a Lua varargs wrapper
 
         // ════════════════════════════════════════════════════════════════════
+        // CPU throttle (debug.sethook)
+        // ════════════════════════════════════════════════════════════════════
+
+        // Number of Lua VM instructions between hook fires. Keep small enough
+        // that throttle reacts within a frame, large enough that the overhead
+        // of the managed→Lua crossing doesn't dominate.
+        private const int CpuHookInstructions = 2000;
+
+        // Last time the hook ran (on the Lua thread). Used to measure the
+        // wall-clock window we're throttling against.
+        private long _lastHookTicks;
+
+        // Minimum milliseconds to spread one hook window over. Derived from the
+        // current CpuHz — T1 = 5 Hz  → 20 ms between hooks worth of work,
+        //                  T2 = 10 Hz → 10 ms, T3 = 20 Hz → 5 ms.
+        private int _hookMinMs = 5;
+
+        private void InstallCpuThrottleHook()
+        {
+            double hz = compComp?.Hardware?.CpuHz ?? 20.0;
+            if (hz < 1.0) hz = 20.0;
+
+            // Target: one CpuHookInstructions window should take ~ 1/hz seconds
+            // scaled by (CpuHookInstructions / InstructionsPerSecondBudget).
+            // We want the *effective* instruction rate to be roughly
+            //   hz * 1000 instructions/sec  (so T3=20 000 inst/s, T2=10 000, T1=5 000).
+            //   → window_ms = CpuHookInstructions / (hz * 1000) * 1000
+            //               = CpuHookInstructions / hz
+            _hookMinMs = Math.Max(1, (int)Math.Round(CpuHookInstructions / hz));
+            _lastHookTicks = Environment.TickCount;
+
+            // Callable from Lua — sleeps the Lua thread to spread execution.
+            // Uses Func<bool> (rather than Action) because NLua's delegate
+            // marshalling path for void returns is more fragile across
+            // versions; a trivial return value keeps the call compatible.
+            lua["__oc_throttle_hook__"] = (Func<bool>)(() =>
+            {
+                if (!running) return true;
+                long now = Environment.TickCount;
+                int elapsed = unchecked((int)(now - _lastHookTicks));
+                int sleepMs = _hookMinMs - elapsed;
+                if (sleepMs > 0)
+                {
+                    try { Thread.Sleep(sleepMs); }
+                    catch (ThreadInterruptedException) { }
+                }
+                _lastHookTicks = Environment.TickCount;
+                return true;
+            });
+
+            try
+            {
+                // Install the instruction-count hook exactly once.
+                lua.DoString(
+                    "debug.sethook(__oc_throttle_hook__, '', " + CpuHookInstructions + ")");
+                Log($"[cpu] throttle hook installed: {hz:0.#} Hz window={_hookMinMs}ms every {CpuHookInstructions} instr");
+            }
+            catch (Exception ex)
+            {
+                Log($"[cpu] failed to install throttle hook: {ex.Message}");
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // Boot Process
         // ════════════════════════════════════════════════════════════════════
 
@@ -1880,6 +1968,15 @@ end
                 lua.DoString("rawset(_G, 'unicode', unicode)");
             }
             catch { }
+
+            // ── CPU throttle (debug.sethook) ─────────────────────────────────
+            // Real OC caps Lua execution at 5/10/20 Hz "clock" ticks where
+            // each tick allows a capped number of instructions before the
+            // thread is suspended until the next tick. We approximate that by
+            // installing an instruction-count hook that sleeps the Lua thread
+            // for the remainder of the current tick window whenever a budget
+            // (_cpuBudgetInst) has been spent.
+            InstallCpuThrottleHook();
 
             luaThread = new Thread(() =>
             {
