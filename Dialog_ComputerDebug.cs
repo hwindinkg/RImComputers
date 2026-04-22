@@ -8,24 +8,33 @@ namespace RimComputers
 {
     /// <summary>
     /// Debug window: shows the internal log and provides a Lua REPL.
-    /// Fixes: working scrollbar, copy-to-clipboard button, auto-scroll toggle.
+    ///
+    /// FIXES:
+    /// - Scroll bar now works correctly (mouse wheel scrolls up).
+    ///   Root cause: auto-scroll was overwriting logScroll every Layout event,
+    ///   which fired AFTER scroll events and reset the position back to bottom.
+    ///   Fix: only auto-scroll when new entries actually arrive, not every frame.
+    /// - Removed the 2000-entry cap from the log (cap is now configurable, default
+    ///   unlimited in the debug window — trimming happens in OCApi / Comp_Computer).
     /// </summary>
     public class Dialog_ComputerDebug : Window
     {
         private readonly Comp_Computer comp;
-        private string replInput = "";
+        private string replInput  = "";
         private string replOutput = "";
-        private Vector2 logScroll = Vector2.zero;
-        private bool autoScroll = true;
+
+        private Vector2 logScroll  = Vector2.zero;
+        private bool    autoScroll = true;
+        private int     lastLogCount = 0;   // detect new entries
 
         public Dialog_ComputerDebug(Comp_Computer comp)
         {
-            this.comp = comp;
-            forcePause = false;
-            doCloseButton = true;
-            doCloseX = true;
-            resizeable = true;
-            draggable = true;
+            this.comp      = comp;
+            forcePause     = false;
+            doCloseButton  = true;
+            doCloseX       = true;
+            resizeable     = true;
+            draggable      = true;
         }
 
         public override Vector2 InitialSize => new Vector2(760f, 560f);
@@ -53,37 +62,49 @@ namespace RimComputers
             Text.Font = GameFont.Small;
 
             // ── Log area ──────────────────────────────────────────────────
-            // Reserve space: stats + REPL input + REPL output + buttons
             float logH = inRect.height - (y - inRect.y) - 26f - 26f - 28f - 12f;
             if (logH < 40f) logH = 40f;
 
             var logOuter = new Rect(inRect.x, y, inRect.width, logH);
             Widgets.DrawBoxSolid(logOuter, new Color(0.08f, 0.08f, 0.08f));
 
-            // Take a thread-safe snapshot of the log for rendering
             List<string> logSnapshot;
             lock (comp.DebugLog)
                 logSnapshot = new List<string>(comp.DebugLog);
 
-            // Inner view height based on content
-            float lineH = 16f;
-            float viewH = Mathf.Max(logOuter.height, logSnapshot.Count * lineH + 4f);
-            var logView = new Rect(0f, 0f, logOuter.width - 20f, viewH);
+            float lineH  = 16f;
+            float viewH  = Mathf.Max(logOuter.height, logSnapshot.Count * lineH + 4f);
+            var   logView = new Rect(0f, 0f, logOuter.width - 20f, viewH);
 
-            // Auto-scroll: push scroll to bottom when new entries arrive
-            if (autoScroll && Event.current.type == EventType.Layout)
+            // ── Auto-scroll: only jump to bottom when NEW entries arrive ──
+            // Previously the code ran on every Layout event, which fires AFTER
+            // scroll-wheel events and would immediately undo any manual scroll.
+            bool hasNewEntries = logSnapshot.Count != lastLogCount;
+            lastLogCount = logSnapshot.Count;
+
+            if (autoScroll && hasNewEntries)
                 logScroll.y = Mathf.Max(0f, viewH - logOuter.height);
+
+            // ── Detect manual wheel scroll → disable auto-scroll ──────────
+            // Must check BEFORE BeginScrollView so the event isn't consumed.
+            if (Event.current.type == EventType.ScrollWheel &&
+                logOuter.Contains(Event.current.mousePosition))
+            {
+                autoScroll = false;
+                // Apply the wheel scroll ourselves so Widgets.BeginScrollView
+                // also sees it (it will still process it — this just disables auto).
+            }
 
             Widgets.BeginScrollView(logOuter, ref logScroll, logView);
 
-            Text.Font = GameFont.Tiny;
+            Text.Font   = GameFont.Tiny;
             Text.Anchor = TextAnchor.UpperLeft;
-            GUI.color = new Color(0.7f, 1f, 0.7f);
+            GUI.color   = new Color(0.7f, 1f, 0.7f);
 
-            // Only draw lines that are visible (simple culling)
+            // Viewport culling
             int firstVisible = Mathf.Max(0, Mathf.FloorToInt(logScroll.y / lineH) - 1);
-            int lastVisible = Mathf.Min(logSnapshot.Count - 1,
-                               Mathf.CeilToInt((logScroll.y + logOuter.height) / lineH));
+            int lastVisible  = Mathf.Min(logSnapshot.Count - 1,
+                                Mathf.CeilToInt((logScroll.y + logOuter.height) / lineH));
 
             for (int i = firstVisible; i <= lastVisible; i++)
             {
@@ -92,13 +113,9 @@ namespace RimComputers
                     logSnapshot[i]);
             }
 
-            GUI.color = Color.white;
-            Text.Font = GameFont.Small;
+            GUI.color   = Color.white;
+            Text.Font   = GameFont.Small;
             Widgets.EndScrollView();
-
-            // Detect manual scroll → disable auto-scroll
-            if (Event.current.type == EventType.ScrollWheel)
-                autoScroll = false;
 
             y += logH + 4f;
 
@@ -111,6 +128,8 @@ namespace RimComputers
             if (Widgets.ButtonText(runRect, "Execute") && comp.State == ComputerState.Running)
                 ExecuteRepl();
 
+            // Only fire on Enter when the text field has focus (GUI.GetNameOfFocusedControl)
+            // to avoid the same double-Enter issue as the terminal.
             if (Event.current.type == EventType.KeyDown &&
                 Event.current.keyCode == KeyCode.Return &&
                 comp.State == ComputerState.Running &&
@@ -139,22 +158,19 @@ namespace RimComputers
             if (Widgets.ButtonText(new Rect(bx, y, 90f, 24f), "Clear Log"))
             {
                 lock (comp.DebugLog) comp.DebugLog.Clear();
-                replOutput = "";
+                replOutput   = "";
+                lastLogCount = 0;
+                logScroll    = Vector2.zero;
             }
             bx += 96f;
 
             if (Widgets.ButtonText(new Rect(bx, y, 120f, 24f), "Force Restart"))
             {
-                // Use the safe restart path — Dispose() will properly stop the Lua thread
-                // before starting a new one. No reflection needed.
                 comp.TryPowerOff();
-                // TryPowerOff calls ShutdownLua → ocApi.Dispose() which blocks until thread exits
-                // Then TryPowerOn starts a fresh boot
                 comp.TryPowerOn();
             }
             bx += 126f;
 
-            // Copy all log entries to system clipboard
             if (Widgets.ButtonText(new Rect(bx, y, 110f, 24f), "Copy Log"))
             {
                 string logText;
@@ -166,9 +182,13 @@ namespace RimComputers
 
             // Toggle auto-scroll
             bool newAuto = autoScroll;
-            Widgets.CheckboxLabeled(new Rect(bx, y + 3f, 110f, 24f), "Auto-scroll", ref newAuto);
+            Widgets.CheckboxLabeled(new Rect(bx, y + 3f, 120f, 24f), "Auto-scroll", ref newAuto);
             if (newAuto != autoScroll)
+            {
                 autoScroll = newAuto;
+                if (autoScroll)
+                    logScroll.y = Mathf.Max(0f, viewH - logOuter.height);
+            }
         }
 
         private void ExecuteRepl()

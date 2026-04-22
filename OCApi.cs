@@ -38,9 +38,36 @@ namespace RimComputers
         private readonly HashSet<string> romKeys =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // Virtual filesystem: normalised path → bytes
-        private readonly Dictionary<string, byte[]> vfs =
+        // ── Two separate virtual filesystems ────────────────────────────────────
+        // romVfs  = read-only, loaded from ROM folder (floppy disk)
+        // hddVfs  = writable, persisted to a real folder on the host OS
+        private readonly Dictionary<string, byte[]> romVfs =
             new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, byte[]> hddVfs =
+            new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+        // Legacy unified VFS — kept for operations that don't care which disk
+        // (e.g. loadfile, require). Merges romVfs + hddVfs, hdd wins on conflict.
+        private Dictionary<string, byte[]> vfs =>
+            BuildMergedVfs();
+
+        private Dictionary<string, byte[]> _mergedVfsCache;
+        private bool _mergedVfsDirty = true;
+
+        private Dictionary<string, byte[]> BuildMergedVfs()
+        {
+            if (!_mergedVfsDirty && _mergedVfsCache != null) return _mergedVfsCache;
+            _mergedVfsCache = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in romVfs)  _mergedVfsCache[kv.Key] = kv.Value;
+            foreach (var kv in hddVfs)  _mergedVfsCache[kv.Key] = kv.Value;
+            _mergedVfsDirty = false;
+            return _mergedVfsCache;
+        }
+
+        private void InvalidateMergedVfs() => _mergedVfsDirty = true;
+
+        // HDD folder on the host OS (persisted between sessions)
+        private readonly string hddFolderPath;
 
         // Signal queue (game thread writes, Lua thread reads)
         private readonly Queue<object[]> signalQueue = new Queue<object[]>();
@@ -49,13 +76,42 @@ namespace RimComputers
         private readonly object logLock = new object();
 
         // Component addresses
-        private readonly string gpuAddr, scrnAddr, fsAddr, eepromAddr, compAddr;
+        private readonly string gpuAddr, scrnAddr, eepromAddr, compAddr, kbdAddr;
+        private readonly string romAddr;   // ROM floppy (read-only)
+        private readonly string hddAddr;   // HDD (writable)
+        // fsAddr kept for backward-compat routing — points to hddAddr
+        private string fsAddr => hddAddr;
+        private string internetAddr; // null when internet card is disabled
+
+        // Internet card state (toggled via gizmo)
+        private volatile bool internetEnabled = false;
 
         // State
         private string eepromData;    // what eeprom.getData() returns
         private string bootAddress;   // which filesystem component to boot from
         private volatile bool running = true;
         public bool IsRunning => running;
+
+        // Toggle internet card on/off (called from game thread via gizmo)
+        public bool InternetEnabled => internetEnabled;
+        public void SetInternetEnabled(bool enabled)
+        {
+            if (internetEnabled == enabled) return;
+            internetEnabled = enabled;
+            if (enabled)
+            {
+                internetAddr = DeterministicGuid(compAddr, "internet");
+                PushSignal("component_added", internetAddr, "internet");
+                Log($"[internet] card enabled, addr={internetAddr}");
+            }
+            else
+            {
+                if (internetAddr != null)
+                    PushSignal("component_removed", internetAddr, "internet");
+                Log("[internet] card disabled");
+                internetAddr = null;
+            }
+        }
 
         // Timing
         private float uptimeSeconds = 0f;
@@ -76,6 +132,13 @@ namespace RimComputers
             public bool Writing;
             public bool Appending;
             public int Pos;
+            // For write handles — the target VFS (hddVfs). Null = read from MergedVfs.
+            public Dictionary<string, byte[]> Vfs;
+            // For read handles — merged ROM+HDD view.
+            public Dictionary<string, byte[]> MergedVfs;
+
+            // Returns the appropriate VFS for reading
+            public Dictionary<string, byte[]> ReadVfs => Writing ? Vfs : MergedVfs;
         }
 
         // ── Threading ────────────────────────────────────────────────────────
@@ -93,7 +156,8 @@ namespace RimComputers
 
         public OCApi(ScreenBuffer screen, CompProperties_Computer props,
                      List<string> log, Thing building,
-                     Dictionary<string, byte[]> persistentVfs = null,
+                     string hddFolderPath = null,
+                     Dictionary<string, byte[]> legacyVfsMigration = null,
                      Comp_Computer compComp = null)
         {
             LoadNativeLua();
@@ -104,48 +168,54 @@ namespace RimComputers
             this.log = log;
             this.building = building;
             this.compComp = compComp;
+            this.hddFolderPath = hddFolderPath;
 
             lua.UseTraceback = true;
 
-            // Generate component addresses
-            gpuAddr = NewGuid8();
-            scrnAddr = NewGuid8();
-            fsAddr = NewGuid8();
-            eepromAddr = NewGuid8();
-            compAddr = building?.ThingID ?? NewGuid8();
+            string baseId = building?.ThingID ?? Guid.NewGuid().ToString("N");
+            gpuAddr    = DeterministicGuid(baseId, "gpu");
+            scrnAddr   = DeterministicGuid(baseId, "screen");
+            romAddr    = DeterministicGuid(baseId, "rom");
+            hddAddr    = DeterministicGuid(baseId, "hdd");
+            eepromAddr = DeterministicGuid(baseId, "eeprom");
+            compAddr   = DeterministicGuid(baseId, "computer");
+            kbdAddr    = DeterministicGuid(baseId, "keyboard");
 
-            // Boot address = our single filesystem component
-            bootAddress = fsAddr;
-            eepromData = fsAddr;   // eeprom stores the boot filesystem address
+            // ── ROM floppy (read-only) ────────────────────────────────────────
+            foreach (var e in RomLoader.Load(romVfs)) log.Add(e);
+            foreach (var k in romVfs.Keys)  romKeys.Add(k);
+            foreach (var v in romVfs.Values) romUsed += v.LongLength;
 
-            // Load ROM into VFS, then snapshot which keys are ROM-originated
-            foreach (var e in RomLoader.Load(vfs)) log.Add(e);
-            foreach (var k in vfs.Keys) romKeys.Add(k);
-            foreach (var v in vfs.Values) romUsed += v.Length;
-
-            // Overlay writable files from previous session ON TOP of ROM.
-            // OpenOS config edits (/etc/hostname, user files, etc.) survive reboot.
-            if (persistentVfs != null)
+            // ── HDD (writable, persisted to folder) ──────────────────────────
+            if (!string.IsNullOrEmpty(hddFolderPath) && Directory.Exists(hddFolderPath))
             {
-                foreach (var kv in persistentVfs)
-                    vfs[kv.Key] = kv.Value;
-                Log($"[OCApi] Restored {persistentVfs.Count} writable VFS entries from save");
+                LoadFolderToVfs(hddFolderPath, hddVfs);
+                Log($"[hdd] Loaded {hddVfs.Count} files from disk folder");
             }
+            else if (legacyVfsMigration != null && legacyVfsMigration.Count > 0)
+            {
+                foreach (var kv in legacyVfsMigration)
+                    if (!romKeys.Contains(kv.Key))
+                        hddVfs[kv.Key] = kv.Value;
+                Log($"[hdd] Migrated {hddVfs.Count} entries from legacy save");
+            }
+            InvalidateMergedVfs();
 
-            // Ensure standard directories exist in VFS
-            foreach (var d in new[] { "bin", "lib", "etc", "tmp", "home", "mnt", "usr", "usr/lib", "boot", "lib/core" })
-                EnsureDir(d);
+            // Boot from HDD if it has an OS, else fall back to ROM (first run / install)
+            bool hddHasOs = hddVfs.ContainsKey("init.lua") || hddVfs.ContainsKey("bios.lua")
+                         || hddVfs.ContainsKey("boot/01_process.lua");
+            bootAddress = hddHasOs ? hddAddr : romAddr;
+            eepromData  = bootAddress;
 
-            if (!vfs.ContainsKey("etc/hostname"))
-                WriteText("etc/hostname", "rimcomp-" + compAddr.Substring(0, 8) + "\n");
+            foreach (var d in new[] { "bin","lib","etc","tmp","home","mnt","usr","boot","lib/core" })
+                EnsureDir(d, hddVfs);
+            if (!hddVfs.ContainsKey("etc/hostname") && !romVfs.ContainsKey("etc/hostname"))
+                WriteText("etc/hostname", "rimcomp-" + hddAddr.Substring(0,8) + "\n", hddVfs);
 
-            Log($"[OCApi] VFS loaded: {vfs.Count} entries, ROM={romUsed / 1024}KB");
+            Log($"[OCApi] ROM={romVfs.Count} files ({romUsed/1024}KB)  HDD={hddVfs.Count} files  boot={bootAddress.Substring(0,8)}...");
 
-            // Register all APIs
             RegisterAll();
 
-            // Compile the chunk-compiler helper ONCE on the game thread
-            // (safe here — we are not inside a Lua callback)
             var res = lua.DoString(
                 @"return function(src, name)
                     return load(src, name, 'bt', _ENV)
@@ -279,7 +349,7 @@ end
 
             // ── computer table ───────────────────────────────────────────────
             lua.DoString(@"computer = {}");
-            lua["computer.address"] = compAddr;
+            lua["computer.address"] = new Func<string>(() => compAddr);
             // tmpAddress ДОЛЖНА быть функцией — OpenOS вызывает computer.tmpAddress()
             lua["computer.tmpAddress"] = (Func<string>)(() => fsAddr);
             lua["computer.totalMemory"] = (Func<long>)(() => props.ramBytes);
@@ -364,7 +434,24 @@ end
             lua["os.exit"] = (Action)(() => { running = false; });
             lua["os.sleep"] = (Action<double>)(secs =>
             {
-                // non-blocking: just let pullSignal drain by timeout
+                // Real OC os.sleep blocks via pullSignal with a timeout.
+                // We replicate that: wait up to 'secs' seconds on the semaphore
+                // (draining and discarding any signals that arrive).
+                if (secs <= 0) return;
+                int totalMs = Math.Min((int)(secs * 1000), 300_000); // cap 5 min
+                int elapsed  = 0;
+                const int chunk = 50;
+                while (running && elapsed < totalMs)
+                {
+                    int wait = Math.Min(chunk, totalMs - elapsed);
+                    signalReady.Wait(wait);
+                    // Drain any signals that woke us so they don't pile up.
+                    lock (signalLock)
+                    {
+                        while (signalQueue.Count > 0) signalQueue.Dequeue();
+                    }
+                    elapsed += wait;
+                }
             });
             lua["os.setenv"] = (Action<string, object>)((k, v) => { });
             lua["os.getenv"] = (Func<string, object>)(k => null);
@@ -469,6 +556,67 @@ end
             RegisterFilesystem();
             RegisterScreen();
             RegisterEeprom();
+
+            // ── Internet response read/close helpers ──────────────────────────
+            lua["__inet_read__"] = (Func<double, string>)(hid =>
+            {
+                int id = (int)hid;
+                if (!_internetResponses.TryGetValue(id, out var state)) return null;
+                if (state.pos >= state.data.Length)
+                {
+                    _internetResponses.Remove(id);
+                    return null; // EOF
+                }
+                int chunk = Math.Min(2048, state.data.Length - state.pos);
+                string part = state.data.Substring(state.pos, chunk);
+                _internetResponses[id] = (state.data, state.pos + chunk);
+                return part;
+            });
+            lua["__inet_close__"] = (Action<double>)(hid =>
+            {
+                _internetResponses.Remove((int)hid);
+            });
+            lua["__inet_response__"] = (Func<double, string>)(hid =>
+            {
+                // Return full response at once (simpler for wget/pastebin usage)
+                int id = (int)hid;
+                if (!_internetResponses.TryGetValue(id, out var state)) return null;
+                string all = state.data;
+                _internetResponses.Remove(id);
+                return all;
+            });
+            // Wrap the internet handle table with proper read/close methods
+            lua.DoString(@"
+do
+    local _inet_read  = __inet_read__
+    local _inet_close = __inet_close__
+    -- Called by InvokeInternet to wrap a response into an OC-compatible handle
+    -- internet.lua calls: request.read() and request.close() (no colon)
+    function __make_inet_handle__(hid)
+        local closed = false
+        local h = {}
+        -- read() called as h.read() by internet.lua wrapper
+        h.read = function(...)
+            if closed then return nil end
+            local chunk = _inet_read(hid)
+            if chunk == nil then
+                closed = true
+                return nil
+            end
+            return chunk
+        end
+        -- close() called as h.close() 
+        h.close = function(...)
+            if not closed then
+                _inet_close(hid)
+                closed = true
+            end
+            return true
+        end
+        return h
+    end
+end
+");
 
             // ── loadfile (VFS-aware, deadlock-safe) ──────────────────────────
             // IMPORTANT: this is called from the Lua thread.
@@ -598,15 +746,19 @@ end
 
             lua["__comp_type_raw__"] = (Func<string, string>)ComponentType;
             lua["__comp_avail_raw__"] = (Func<string, bool>)ComponentAvailable;
+            lua["__comp_address_raw__"] = (Func<string>)(() => compAddr);
 
             lua.DoString(@"
 component.type = function(addr)   return __comp_type_raw__(addr) end
 component.isAvailable = function(t) return __comp_avail_raw__(t) end
+component.address = function() return __comp_address_raw__() end
 
 -- proxy захватывает __comp_invoke_raw__ напрямую в замыкание,
 -- чтобы не зависеть от глобального _G.component (boot.lua делает _G.component = nil)
 component.proxy = function(addr)
     local t = __comp_type_raw__(addr)
+    -- Если адрес неизвестен — вернуть nil, как в реальном OC
+    if not t then return nil end
     -- Захватываем invoke-функцию прямо сейчас, не через component.invoke
     local _invoke_raw = __comp_invoke_raw__
     local function invoke_method(method, ...)
@@ -648,15 +800,19 @@ end
         {
             lock (logLock) { Log($"[ComponentListHelper] filter='{filter}', exact={exact}"); }
 
-            // keyboard uses the same address as computer (compAddr)
-            var all = new[]
+            var all = new List<(string addr, string type)>
             {
                 (gpuAddr,    "gpu"),
                 (scrnAddr,   "screen"),
-                (fsAddr,     "filesystem"),
+                (romAddr,    "filesystem"),   // ROM floppy (read-only)
+                (hddAddr,    "filesystem"),   // HDD (writable)
                 (eepromAddr, "eeprom"),
-                (compAddr,   "keyboard"),
+                (kbdAddr,    "keyboard"),
+                (compAddr,   "computer"),
             };
+
+            if (internetEnabled && internetAddr != null)
+                all.Add((internetAddr, "internet"));
 
             var tbl = NewLuaTable();
             int count = 0;
@@ -665,68 +821,77 @@ end
                 bool match = string.IsNullOrEmpty(filter) ||
                              (exact ? type == filter : type.Contains(filter));
                 if (!match) continue;
-
                 tbl[addr] = type;
                 count++;
-                lock (logLock) { Log($"[ComponentListHelper] added: {addr} = {type}"); }
+                lock (logLock) { Log($"[ComponentListHelper] {addr.Substring(0,8)} = {type}"); }
             }
-            lock (logLock) { Log($"[ComponentListHelper] returning table with {count} entries"); }
+            lock (logLock) { Log($"[ComponentListHelper] {count} entries"); }
             return tbl;
         }
 
         private string ComponentType(string addr)
         {
-            if (addr == gpuAddr) return "gpu";
-            if (addr == scrnAddr) return "screen";
-            if (addr == fsAddr) return "filesystem";
+            if (addr == gpuAddr)    return "gpu";
+            if (addr == scrnAddr)   return "screen";
+            if (addr == romAddr)    return "filesystem";
+            if (addr == hddAddr)    return "filesystem";
             if (addr == eepromAddr) return "eeprom";
-            if (addr == compAddr) return "keyboard";
+            if (addr == kbdAddr)    return "keyboard";
+            if (addr == compAddr)   return "computer";
+            if (internetEnabled && addr == internetAddr) return "internet";
             return null;
         }
 
         private bool ComponentAvailable(string type)
             => type == "gpu" || type == "screen" ||
                type == "filesystem" || type == "eeprom" ||
-               type == "keyboard";
+               type == "keyboard" || type == "computer" ||
+               (type == "internet" && internetEnabled);
+
+        // ── Методы, которые вызываются сотни раз в секунду — не логируем ────────
+        private static readonly HashSet<string> _quietInvoke = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            "set","fill","copy","setBackground","setForeground","setForegroundColor",
+            "setBackgroundColor","getBackground","getForeground","getScreen",
+            "getCursor","setCursor","cursorBlink",
+            "read","write","seek",
+        };
 
         // Called from Lua wrapper (Lua thread). args = {[1]=v1,[2]=v2,...}
         private LuaTable ComponentInvoke(string addr, string method, LuaTable args)
         {
-            lock (logLock) { Log($"[invoke] {addr}::{method}"); }
+            if (!_quietInvoke.Contains(method))
+                lock (logLock) { Log($"[invoke] {addr.Substring(0,8)}::{method}"); }
             try
             {
                 var argList = new List<object>();
                 if (args != null)
-                {
-                    for (int i = 1; ; i++)
-                    {
-                        var v = args[i];
-                        if (v == null) break;
-                        argList.Add(v);
-                    }
-                }
+                    for (int i = 1; ; i++) { var v = args[i]; if (v == null) break; argList.Add(v); }
                 var a = argList.ToArray();
 
                 object[] result;
-                if (addr == gpuAddr) result = InvokeGpu(method, a);
-                else if (addr == fsAddr) result = InvokeFs(method, a);
-                else if (addr == scrnAddr) result = InvokeScreen(method, a);
-                else if (addr == eepromAddr) result = InvokeEeprom(method, a);
-                else if (addr == compAddr) result = InvokeKeyboard(method, a);
+                if      (addr == gpuAddr)   result = InvokeGpu(method, a);
+                else if (addr == romAddr)   result = InvokeFsOnVfs(method, a, romVfs, readOnly: true);
+                else if (addr == hddAddr)   result = InvokeFsOnVfs(method, a, hddVfs, readOnly: false);
+                else if (addr == scrnAddr)  result = InvokeScreen(method, a);
+                else if (addr == eepromAddr)result = InvokeEeprom(method, a);
+                else if (addr == kbdAddr)   result = InvokeKeyboard(method, a);
+                else if (addr == compAddr)  result = InvokeComputer(method, a);
+                else if (internetEnabled && addr == internetAddr) result = InvokeInternet(method, a);
                 else return MakeResultTable(false, null, "unknown component: " + addr);
 
                 if (result == null)
                 {
                     var nilTbl = NewLuaTable();
-                    nilTbl["ok"] = true;
-                    nilTbl["isnil"] = true;
+                    nilTbl["ok"] = true; nilTbl["isnil"] = true;
                     return nilTbl;
                 }
                 return MakeResultTable(true, result, null);
             }
             catch (Exception ex)
             {
-                lock (logLock) { Log($"[invoke] ERROR {addr}::{method}: {ex.Message}"); }
+                lock (logLock) { Log($"[invoke] ERR {addr.Substring(0,8)}::{method}: {ex.Message}"); }
                 return MakeResultTable(false, null, ex.Message);
             }
         }
@@ -735,6 +900,8 @@ end
         {
             switch (method)
             {
+                case "address":
+                    return new object[] { kbdAddr };
                 case "isControl":
                     if (args.Length >= 1)
                     {
@@ -747,35 +914,218 @@ end
             }
         }
 
+        private object[] InvokeComputer(string method, object[] args)
+        {
+            switch (method)
+            {
+                case "address": return new object[] { compAddr };
+                case "tmpAddress": return new object[] { fsAddr };
+                case "freeMemory": return new object[] { (double)(props.ramBytes - ramUsed) };
+                case "totalMemory": return new object[] { (double)props.ramBytes };
+                case "uptime": return new object[] { (double)uptimeSeconds };
+                case "energy": return new object[] { 100.0 };
+                case "maxEnergy": return new object[] { 100.0 };
+                case "isRunning": return new object[] { running };
+                case "beep":
+                    {
+                        float freq = args.Length > 0 ? (float)Convert.ToDouble(args[0]) : 1000f;
+                        float dur = args.Length > 1 ? (float)Convert.ToDouble(args[1]) : 0.1f;
+                        lock (signalLock) { _beepQueue.Enqueue((freq, dur)); }
+                        return null;
+                    }
+                case "shutdown":
+                    {
+                        bool reboot = args.Length > 0 && args[0] is bool b && b;
+                        running = false;
+                        try { signalReady.Release(10); } catch { }
+                        compComp?.RequestShutdown(reboot);
+                        return null;
+                    }
+                case "getProgramLocations": return new object[] { NewLuaTable() };
+                default: return new object[] { null };
+            }
+        }
+
+        // Internet card implementation — HTTP requests via System.Net.WebClient
+        private object[] InvokeInternet(string method, object[] args)
+        {
+            string Str(int i) => i < args.Length ? args[i]?.ToString() ?? "" : "";
+            switch (method)
+            {
+                case "isHttpEnabled": return new object[] { true };
+                case "isTcpEnabled": return new object[] { false };
+                case "request":
+                    {
+                        string url = Str(0);
+                        string postData = args.Length > 1 && args[1] != null ? Str(1) : null;
+
+                        try
+                        {
+#pragma warning disable SYSLIB0014
+                            var client = new System.Net.WebClient();
+#pragma warning restore SYSLIB0014
+                            client.Headers["User-Agent"] = "OpenComputers/1.7.5 RimComputers/1.0";
+
+                            // Extra headers from table arg[2]
+                            if (args.Length > 2 && args[2] is LuaTable headers)
+                            {
+                                foreach (System.Collections.DictionaryEntry kv in headers)
+                                    client.Headers[kv.Key.ToString()] = kv.Value?.ToString() ?? "";
+                            }
+
+                            byte[] responseBytes;
+                            if (!string.IsNullOrEmpty(postData))
+                            {
+                                if (!client.Headers.AllKeys.Any(
+                                    k => k.Equals("Content-Type", StringComparison.OrdinalIgnoreCase)))
+                                    client.Headers["Content-Type"] = "application/x-www-form-urlencoded";
+                                responseBytes = client.UploadData(url,
+                                    System.Text.Encoding.UTF8.GetBytes(postData));
+                            }
+                            else
+                            {
+                                responseBytes = client.DownloadData(url);
+                            }
+
+                            string responseStr = System.Text.Encoding.UTF8.GetString(responseBytes);
+                            int hid = nextHandle++;
+                            _internetResponses[hid] = (responseStr, 0);
+
+                            // Build handle via Lua helper (must call from Lua thread — this IS the Lua thread)
+                            var makeHandle = lua["__make_inet_handle__"] as LuaFunction;
+                            if (makeHandle != null)
+                            {
+                                var result = makeHandle.Call((double)hid);
+                                Log($"[internet] HTTP OK url={url} bytes={responseBytes.Length}");
+                                return result != null && result.Length > 0
+                                    ? new object[] { result[0] }
+                                    : new object[] { null, "handle creation failed" };
+                            }
+                            // Fallback: just return hid as number
+                            return new object[] { (double)hid };
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"[internet] HTTP error: {ex.Message}");
+                            return new object[] { null, ex.Message };
+                        }
+                    }
+                default: return new object[] { null };
+            }
+        }
+
+        // Storage for internet response streams
+        private readonly Dictionary<int, (string data, int pos)> _internetResponses =
+            new Dictionary<int, (string, int)>();
+
         // ════════════════════════════════════════════════════════════════════
         // unicode
         // ════════════════════════════════════════════════════════════════════
 
         private void RegisterUnicode()
         {
-            // All in Lua — avoids NLua double→int marshalling failures.
-            // unicode.char is safe-guarded to [0,255] so string.char never throws.
+            // CRITICAL FIX: All unicode functions use LOCAL upvalues to reference
+            // each other — NOT the global 'unicode' table.
+            //
+            // Root cause of the crash: OpenOS's boot process (lib/core/boot.lua,
+            // boot/04_component.lua, etc.) replaces or scopes _ENV. When code runs
+            // in the new _ENV, looking up 'unicode' as a global fails → nil.
+            // If unicode.wlen calls unicode.len (global lookup), it crashes with
+            // "attempt to index a nil value (global 'unicode')".
+            //
+            // Solution: define all implementations as local functions first, then
+            // assign them to the unicode table. The functions never reference 'unicode'
+            // inside their bodies — they use upvalues.
+            //
+            // unicode.char uses utf8.char (Lua 5.3 built-in, always present in NLua).
+            // This correctly handles box-drawing (U+2500+), arrows (U+2190+), etc.
             lua.DoString(@"
-unicode = {}
-function unicode.len(s)   return type(s)=='string' and #s or 0 end
-function unicode.wlen(s)  return type(s)=='string' and #s or 0 end
-function unicode.charWidth(s) return 1 end
-function unicode.isWide(s)    return false end
-function unicode.char(...)
-    local r = ''
-    for _, v in ipairs({...}) do
-        local n = math.floor(v)
-        if n >= 0 and n <= 255 then r = r .. string.char(n) end
+do
+    -- ── char ────────────────────────────────────────────────────────────────
+    local function char_impl(...)
+        local r = ''
+        local n = select('#', ...)
+        for i = 1, n do
+            local cp = select(i, ...)
+            if type(cp) == 'number' then
+                cp = math.floor(cp + 0.5)
+                if cp >= 0 then
+                    if cp < 128 then
+                        r = r .. string.char(cp)
+                    elseif utf8 then
+                        -- utf8.char is part of Lua 5.3 standard library
+                        local ok, ch = pcall(utf8.char, cp)
+                        if ok then r = r .. ch end
+                    end
+                end
+            end
+        end
+        return r
     end
-    return r
+
+    -- ── len ─────────────────────────────────────────────────────────────────
+    local function len_impl(s)
+        if type(s) ~= 'string' then return 0 end
+        if utf8 then
+            local n = utf8.len(s)
+            return n or 0
+        end
+        -- fallback: count non-continuation bytes
+        local n = 0
+        for i = 1, #s do
+            local b = string.byte(s, i)
+            if b < 0x80 or b >= 0xC0 then n = n + 1 end
+        end
+        return n
+    end
+
+    -- ── sub ─────────────────────────────────────────────────────────────────
+    local function sub_impl(s, i, j)
+        if type(s) ~= 'string' then return '' end
+        j = (j ~= nil) and j or -1
+        if not utf8 then return string.sub(s, i, j) end
+        local slen = len_impl(s)  -- uses upvalue len_impl, NOT unicode.len
+        if i < 0 then i = slen + i + 1 end
+        if j < 0 then j = slen + j + 1 end
+        if i < 1 then i = 1 end
+        if j > slen then j = slen end
+        if i > j then return '' end
+        local bstart = utf8.offset(s, i)
+        if not bstart then return '' end
+        local bend
+        if j >= slen then
+            bend = #s
+        else
+            local next = utf8.offset(s, j + 1)
+            bend = next and (next - 1) or #s
+        end
+        return string.sub(s, bstart, bend)
+    end
+
+    -- ── wtrunc ──────────────────────────────────────────────────────────────
+    local function wtrunc_impl(s, width)
+        if type(s) ~= 'string' then return '' end
+        local w = math.floor(width or 1)
+        if w <= 1 then return '' end
+        return sub_impl(s, 1, w - 1)  -- upvalue sub_impl
+    end
+
+    -- ── Assign to global unicode table ──────────────────────────────────────
+    -- Functions captured by upvalue — safe even if 'unicode' is nil later.
+    unicode = {
+        char      = char_impl,
+        len       = len_impl,
+        wlen      = len_impl,    -- same impl, captured directly
+        wtrunc    = wtrunc_impl,
+        sub       = sub_impl,
+        lower     = function(s) return type(s)=='string' and string.lower(s) or '' end,
+        upper     = function(s) return type(s)=='string' and string.upper(s) or '' end,
+        charWidth = function(ch) return 1 end,
+        isWide    = function(ch) return false end,
+    }
 end
-function unicode.sub(s, i, j)
-    if type(s) ~= 'string' then return '' end
-    return string.sub(s, math.floor(i or 1), j ~= nil and math.floor(j) or #s)
-end
-function unicode.lower(s) return type(s)=='string' and string.lower(s) or '' end
-function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
 ");
+
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -785,7 +1135,7 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
         private void RegisterGpu()
         {
             lua.DoString(@"gpu = {}");
-            lua["gpu.address"] = gpuAddr;
+            lua["gpu.address"] = (Func<string>)(() => gpuAddr);
             lua["gpu.type"] = "gpu";
         }
 
@@ -794,10 +1144,20 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
             switch (method)
             {
                 case "getResolution":
+                    return new object[] { (double)screen.Width, (double)screen.Height };
                 case "maxResolution":
                     return new object[] { (double)props.screenWidth, (double)props.screenHeight };
                 case "setResolution":
+                {
+                    if (args.Length >= 2)
+                    {
+                        int nw = Math.Max(1, Math.Min(ToInt(args[0]), props.screenWidth));
+                        int nh = Math.Max(1, Math.Min(ToInt(args[1]), props.screenHeight));
+                        screen.Resize(nw, nh);
+                        Log($"[gpu] setResolution {nw}x{nh}");
+                    }
                     return new object[] { true };
+                }
                 case "getScreen":
                     return new object[] { scrnAddr };
                 case "bind":
@@ -807,24 +1167,36 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
                     if (args.Length >= 3)
                     {
                         bool vert = args.Length >= 4 && args[3] is bool b && b;
-                        screen.Set(ToInt(args[0]) - 1, ToInt(args[1]) - 1,
-                                   args[2]?.ToString() ?? "", vert);
+                        int sx = ToInt(args[0]) - 1;
+                        int sy = ToInt(args[1]) - 1;
+                        string stext = args[2]?.ToString() ?? "";
+                        screen.Set(sx, sy, stext, vert);
+                        // Do NOT update screen.CursorX/Y here — OpenOS manages
+                        // the cursor position itself via gpu.setCursor / cursorBlink.
                     }
                     return new object[] { true };
                 case "get":
                     if (args.Length >= 2)
                     {
                         var (c, fg, bg) = screen.Get(ToInt(args[0]) - 1, ToInt(args[1]) - 1);
-                        long fgn = (fg.r << 16) | (fg.g << 8) | fg.b;
-                        long bgn = (bg.r << 16) | (bg.g << 8) | bg.b;
-                        return new object[] { c.ToString(), (double)fgn, (double)bgn, false, false };
+                        long fgn = ((long)fg.r << 16) | ((long)fg.g << 8) | fg.b;
+                        long bgn = ((long)bg.r << 16) | ((long)bg.g << 8) | bg.b;
+                        return new object[] { c, (double)fgn, (double)bgn, false, false };
                     }
                     return new object[] { " " };
                 case "fill":
                     if (args.Length >= 5)
-                        screen.Fill(ToInt(args[0]) - 1, ToInt(args[1]) - 1,
-                                    ToInt(args[2]), ToInt(args[3]),
-                                    args[4]?.ToString()?.Length > 0 ? args[4].ToString()[0] : ' ');
+                    {
+                        string fillStr = args[4]?.ToString() ?? " ";
+                        if (string.IsNullOrEmpty(fillStr)) fillStr = " ";
+                        // For single ASCII char use the fast char path; for Unicode use FillStr
+                        if (fillStr.Length == 1 && fillStr[0] < 128)
+                            screen.Fill(ToInt(args[0]) - 1, ToInt(args[1]) - 1,
+                                        ToInt(args[2]), ToInt(args[3]), fillStr[0]);
+                        else
+                            screen.FillStr(ToInt(args[0]) - 1, ToInt(args[1]) - 1,
+                                           ToInt(args[2]), ToInt(args[3]), fillStr);
+                    }
                     return new object[] { true };
                 case "copy":
                     if (args.Length >= 6)
@@ -835,27 +1207,41 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
                 case "setBackground":
                     if (args.Length >= 1)
                     {
+                        var prevBG = screen.CurrentBG;
+                        long prevBGn = ((long)prevBG.r << 16) | ((long)prevBG.g << 8) | prevBG.b;
                         long c = Convert.ToInt64(args[0]);
                         screen.CurrentBG = new Color32(
                             (byte)((c >> 16) & 0xFF),
                             (byte)((c >> 8) & 0xFF),
                             (byte)(c & 0xFF), 255);
+                        return new object[] { (double)prevBGn, false };
                     }
                     return new object[] { 0.0, false };
                 case "setForeground":
                     if (args.Length >= 1)
                     {
+                        var prevFG = screen.CurrentFG;
+                        long prevFGn = ((long)prevFG.r << 16) | ((long)prevFG.g << 8) | prevFG.b;
                         long c = Convert.ToInt64(args[0]);
                         screen.CurrentFG = new Color32(
                             (byte)((c >> 16) & 0xFF),
                             (byte)((c >> 8) & 0xFF),
                             (byte)(c & 0xFF), 255);
+                        return new object[] { (double)prevFGn, false };
                     }
                     return new object[] { (double)0xFFFFFF, false };
                 case "getBackground":
-                    return new object[] { 0.0, false };
+                    {
+                        var bg2 = screen.CurrentBG;
+                        long bgn2 = ((long)bg2.r << 16) | ((long)bg2.g << 8) | bg2.b;
+                        return new object[] { (double)bgn2, false };
+                    }
                 case "getForeground":
-                    return new object[] { (double)0xFFFFFF, false };
+                    {
+                        var fg2 = screen.CurrentFG;
+                        long fgn2 = ((long)fg2.r << 16) | ((long)fg2.g << 8) | fg2.b;
+                        return new object[] { (double)fgn2, false };
+                    }
                 case "getPaletteColor":
                     if (args.Length >= 1)
                     {
@@ -871,9 +1257,22 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
                 case "setPaletteColor": return new object[] { 0.0 };
                 case "getDepth": return new object[] { 8.0 };
                 case "maxDepth": return new object[] { 8.0 };
-                case "setDepth": return new object[] { args.Length > 0 ? args[0] : (object)8.0 };
-                case "getViewport": return new object[] { (double)props.screenWidth, (double)props.screenHeight };
+                case "setDepth": return new object[] { 8.0 }; // return previous depth
+                case "getViewport": return new object[] { (double)screen.Width, (double)screen.Height };
                 case "setViewport": return new object[] { true };
+                case "setCursor":
+                    if (args.Length >= 2)
+                    {
+                        screen.CursorX = ToInt(args[0]) - 1;
+                        screen.CursorY = ToInt(args[1]) - 1;
+                    }
+                    return new object[] { true };
+                case "getCursor":
+                    return new object[] { (double)(screen.CursorX + 1), (double)(screen.CursorY + 1) };
+                case "cursorBlink":
+                    if (args.Length >= 1 && args[0] is bool blink)
+                        screen.CursorVisible = blink;
+                    return new object[] { true };
                 default:
                     return new object[] { null, "unknown gpu method: " + method };
             }
@@ -886,112 +1285,41 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
         private void RegisterFilesystem()
         {
             lua.DoString(@"filesystem = {}");
-            lua["filesystem.address"] = fsAddr;
+            lua["filesystem.address"] = (Func<string>)(() => fsAddr);
             lua["filesystem.type"] = "filesystem";
         }
 
-        private bool FsExists(string path) => vfs.ContainsKey(Norm(path)) || IsDir(path);
-        private bool FsIsDirectory(string path) => IsDir(Norm(path));
-        private long FsSize(string path) => vfs.TryGetValue(Norm(path), out var b) ? b.LongLength : 0L;
-
-        private bool IsDir(string path)
-        {
-            string prefix = Norm(path);
-            if (prefix.Length > 0 && !prefix.EndsWith("/")) prefix += "/";
-            return vfs.Keys.Any(k =>
-                k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-        }
-
-        // Returns a table {[1]="name",[2]="name/",...} matching OC filesystem.list
-        private LuaTable FsList(string path)
-        {
-            var result = NewLuaTable();
-            string prefix = Norm(path);
-            if (prefix.Length > 0 && !prefix.EndsWith("/")) prefix += "/";
-
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            int idx = 1;
-            foreach (var k in vfs.Keys)
-            {
-                if (prefix.Length > 0 &&
-                    !k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
-
-                string rel = k.Substring(prefix.Length);
-                if (rel == "" || rel == ".dir") continue;
-
-                // skip internal .dir markers
-                if (rel.EndsWith("/.dir"))
-                {
-                    string dirName = rel.Substring(0, rel.Length - 4) + "/";
-                    int slash2 = dirName.IndexOf('/');
-                    string entry2 = slash2 < 0 ? dirName : dirName.Substring(0, slash2 + 1);
-                    if (seen.Add(entry2)) result[idx++] = entry2;
-                    continue;
-                }
-
-                int slash = rel.IndexOf('/');
-                string entry = slash < 0 ? rel : rel.Substring(0, slash) + "/";
-                if (entry == ".dir/") continue;
-                if (seen.Add(entry)) result[idx++] = entry;
-            }
-            return result;
-        }
-
-        private object[] FsOpen(string path, string mode)
-        {
-            mode = mode ?? "r";
-            string npath = Norm(path);
-            bool reading = mode.Contains("r");
-            bool appending = mode.Contains("a");
-            bool writing = mode.Contains("w") || appending;
-
-            if (reading && !vfs.ContainsKey(npath))
-                return new object[] { null, "file not found: " + path };
-
-            if (writing && !vfs.ContainsKey(npath))
-                vfs[npath] = Array.Empty<byte>();
-
-            int id = nextHandle++;
-            openHandles[id] = new FileHandle
-            {
-                Path = npath,
-                Writing = writing,
-                Appending = appending,
-                Pos = appending && vfs.TryGetValue(npath, out var ab) ? ab.Length : 0
-            };
-            Log($"[fs] open '{path}' mode={mode} → handle {id}");
-            return new object[] { (double)id };
-        }
-
-        private void FsClose(int handle) => openHandles.Remove(handle);
+        // Legacy shims kept for loadfile/require which still call these
+        private bool FsExists(string path)      => FsExistsIn(path, BuildMergedVfs());
+        private bool FsIsDirectory(string path) => IsDirIn(path, BuildMergedVfs());
+        private long FsSize(string path)        => FsSizeIn(path, BuildMergedVfs());
+        private LuaTable FsList(string path)    => FsListIn(path, BuildMergedVfs());
+        private void FsClose(int handle)        => openHandles.Remove(handle);
 
         private object[] FsRead(int handle, double count)
         {
-            if (!openHandles.TryGetValue(handle, out var h))
-                return new object[] { null, "bad file handle" };
-            if (!vfs.TryGetValue(h.Path, out var data)) return null; // EOF
+            if (!openHandles.TryGetValue(handle, out var h)) return new object[] { null, "bad handle" };
+            var src = h.ReadVfs ?? BuildMergedVfs();
+            if (!src.TryGetValue(h.Path, out var data)) return null; // EOF
             if (h.Pos >= data.Length) return null; // EOF
-
-            // math.maxinteger or math.huge означает "читать всё"
             int n;
             if (double.IsInfinity(count) || double.IsNaN(count) || count >= int.MaxValue)
                 n = data.Length - h.Pos;
             else
                 n = Math.Min(Math.Max(0, (int)count), data.Length - h.Pos);
-
-            if (n == 0) return null; // EOF
-
+            if (n == 0) return null;
             string chunk = Encoding.UTF8.GetString(data, h.Pos, n);
             h.Pos += n;
             return new object[] { chunk };
         }
 
-        private bool FsWrite(int handle, string content)
+        private bool FsWrite(int handle, string content,
+            Dictionary<string, byte[]> targetVfs = null)
         {
             if (!openHandles.TryGetValue(handle, out var h)) return false;
+            var vfsTarget = targetVfs ?? h.Vfs ?? hddVfs;
             byte[] bytes = Encoding.UTF8.GetBytes(content ?? "");
-            if (!vfs.TryGetValue(h.Path, out var cur)) cur = Array.Empty<byte>();
-
+            if (!vfsTarget.TryGetValue(h.Path, out var cur)) cur = Array.Empty<byte>();
             byte[] newData;
             if (h.Appending || h.Pos >= cur.Length)
             {
@@ -1008,14 +1336,17 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
                 Buffer.BlockCopy(bytes, 0, newData, h.Pos, bytes.Length);
                 h.Pos += bytes.Length;
             }
-            vfs[h.Path] = newData;
+            vfsTarget[h.Path] = newData;
+            InvalidateMergedVfs();
             return true;
         }
 
-        private double FsSeek(int handle, string whence, int offset)
+        private double FsSeek(int handle, string whence, int offset,
+            Dictionary<string, byte[]> merged = null)
         {
             if (!openHandles.TryGetValue(handle, out var h)) return 0;
-            var data = vfs.TryGetValue(h.Path, out var d) ? d : Array.Empty<byte>();
+            var src = merged ?? h.ReadVfs ?? BuildMergedVfs();
+            var data = src.TryGetValue(h.Path, out var d) ? d : Array.Empty<byte>();
             if (whence == "set") h.Pos = offset;
             else if (whence == "cur") h.Pos += offset;
             else if (whence == "end") h.Pos = data.Length + offset;
@@ -1023,43 +1354,146 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
             return h.Pos;
         }
 
-        private object[] InvokeFs(string method, object[] args)
+        // Legacy shim — routes to the correct VFS based on address
+        private object[] InvokeFs(string method, object[] args) =>
+            InvokeFsOnVfs(method, args, hddVfs, readOnly: false);
+
+        private object[] InvokeFsOnVfs(string method, object[] args,
+            Dictionary<string, byte[]> targetVfs, bool readOnly)
         {
-            lock (logLock) { Log($"[fs] {method}"); }
+            if (!_quietInvoke.Contains(method))
+                lock (logLock) { Log($"[fs] {method}"); }
             string Str(int i) => i < args.Length ? args[i]?.ToString() ?? "" : "";
-            int Int(int i) => i < args.Length ? ToInt(args[i]) : 0;
-            double Dbl(int i) => i < args.Length && args[i] != null
-                                 ? Convert.ToDouble(args[i]) : 0;
+            int    Int(int i) => i < args.Length ? ToInt(args[i]) : 0;
+            double Dbl(int i) => i < args.Length && args[i] != null ? Convert.ToDouble(args[i]) : 0;
+
+            // For read operations we search ROM first then HDD (merged view)
+            var merged = BuildMergedVfs();
+
             switch (method)
             {
-                case "isReadOnly": return new object[] { false };
-                case "spaceTotal": return new object[] { props.romBytes };
-                case "spaceUsed": return new object[] { vfs.Values.Sum(v => v.LongLength) };
-                case "exists": return new object[] { FsExists(Str(0)) };
-                case "isDirectory": return new object[] { FsIsDirectory(Str(0)) };
-                case "size": return new object[] { FsSize(Str(0)) };
-                case "list": return new object[] { FsList(Str(0)) };
-                case "open": return FsOpen(Str(0), args.Length > 1 ? Str(1) : "r");
-                case "close": FsClose(Int(0)); return new object[] { true };
-                case "read": return FsRead(Int(0), Dbl(1));
-                case "write": return new object[] { FsWrite(Int(0), Str(1)) };
-                case "seek": return new object[] { FsSeek(Int(0), Str(1), Int(2)) };
-                case "makeDirectory": EnsureDir(Str(0)); return new object[] { true };
-                case "remove": vfs.Remove(Norm(Str(0))); return new object[] { true };
+                case "isReadOnly":   return new object[] { readOnly };
+                case "spaceTotal":   return new object[] { readOnly ? (long)4096000 : props.romBytes };
+                case "spaceUsed":    return new object[] { targetVfs.Values.Sum(v => v.LongLength) };
+                case "exists":       return new object[] { FsExistsIn(Str(0), merged) };
+                case "isDirectory":  return new object[] { IsDirIn(Str(0), merged) };
+                case "size":         return new object[] { FsSizeIn(Str(0), merged) };
+                case "list":         return new object[] { FsListIn(Str(0), merged) };
+                case "open":
+                    // Writes always go to HDD, reads search merged
+                    return FsOpenOn(Str(0), args.Length > 1 ? Str(1) : "r",
+                                   targetVfs, merged, readOnly);
+                case "close":        FsClose(Int(0)); return new object[] { true };
+                case "read":         return FsRead(Int(0), Dbl(1));
+                case "write":        return new object[] { FsWrite(Int(0), Str(1), targetVfs) };
+                case "seek":         return new object[] { FsSeek(Int(0), Str(1), Int(2), merged) };
+                case "makeDirectory":
+                    if (readOnly) return new object[] { null, "filesystem is read-only" };
+                    EnsureDir(Str(0), targetVfs); InvalidateMergedVfs();
+                    return new object[] { true };
+                case "remove":
+                    if (readOnly) return new object[] { null, "filesystem is read-only" };
+                    targetVfs.Remove(Norm(Str(0))); InvalidateMergedVfs();
+                    return new object[] { true };
                 case "rename":
-                    {
-                        string nf = Norm(Str(0)), nt = Norm(Str(1));
-                        if (!vfs.TryGetValue(nf, out var rd))
-                            return new object[] { null, "not found" };
-                        vfs[nt] = rd; vfs.Remove(nf);
-                        return new object[] { true };
-                    }
-                case "lastModified": return new object[] { 0L };
-                case "getLabel": return new object[] { "rimcomp" };
-                case "setLabel": return new object[] { true };
+                {
+                    if (readOnly) return new object[] { null, "filesystem is read-only" };
+                    string nf = Norm(Str(0)), nt = Norm(Str(1));
+                    if (!merged.TryGetValue(nf, out var rd)) return new object[] { null, "not found" };
+                    targetVfs[nt] = rd; targetVfs.Remove(nf); InvalidateMergedVfs();
+                    return new object[] { true };
+                }
+                case "lastModified":
+                    return new object[] { DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                case "getLabel": return new object[] { readOnly ? "rom" : "hdd" };
+                case "setLabel":
+                    if (readOnly) return new object[] { null, "read-only" };
+                    return new object[] { true };
                 default:
                     return new object[] { null, "unknown fs method: " + method };
             }
+        }
+
+        // ── Per-VFS FS helpers ────────────────────────────────────────────────
+
+        private bool FsExistsIn(string path, Dictionary<string, byte[]> v)
+            => v.ContainsKey(Norm(path)) || IsDirIn(path, v);
+
+        private bool IsDirIn(string path, Dictionary<string, byte[]> v)
+        {
+            string prefix = Norm(path);
+            if (!prefix.EndsWith("/")) prefix += "/";
+            return v.Keys.Any(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private long FsSizeIn(string path, Dictionary<string, byte[]> v)
+            => v.TryGetValue(Norm(path), out var b) ? b.LongLength : 0L;
+
+        private LuaTable FsListIn(string path, Dictionary<string, byte[]> v)
+        {
+            var result = NewLuaTable();
+            string prefix = Norm(path);
+            if (prefix.Length > 0 && !prefix.EndsWith("/")) prefix += "/";
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int idx = 1;
+            foreach (var k in v.Keys)
+            {
+                if (prefix.Length > 0 && !k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                string rel = k.Substring(prefix.Length);
+                if (rel == "" || rel == ".dir") continue;
+                if (rel.EndsWith("/.dir"))
+                {
+                    string dirName = rel.Substring(0, rel.Length - 4) + "/";
+                    int s2 = dirName.IndexOf('/');
+                    string e2 = s2 < 0 ? dirName : dirName.Substring(0, s2 + 1);
+                    if (seen.Add(e2)) result[idx++] = e2;
+                    continue;
+                }
+                int slash = rel.IndexOf('/');
+                string entry = slash < 0 ? rel : rel.Substring(0, slash) + "/";
+                if (entry == ".dir/") continue;
+                if (seen.Add(entry)) result[idx++] = entry;
+            }
+            return result;
+        }
+
+        private object[] FsOpenOn(string path, string mode,
+            Dictionary<string, byte[]> targetVfs,
+            Dictionary<string, byte[]> merged,
+            bool readOnly)
+        {
+            mode = mode ?? "r";
+            string npath = Norm(path);
+            bool reading  = mode.Contains("r");
+            bool appending = mode.Contains("a");
+            bool writing  = mode.Contains("w") || appending;
+
+            if (readOnly && writing) return new object[] { null, "filesystem is read-only" };
+
+            if (reading && !merged.ContainsKey(npath))
+                return new object[] { null, "file not found: " + path };
+
+            // For writes, always create/truncate in targetVfs (HDD)
+            if (writing && !targetVfs.ContainsKey(npath))
+            {
+                targetVfs[npath] = Array.Empty<byte>();
+                if (!appending) targetVfs[npath] = Array.Empty<byte>();
+                InvalidateMergedVfs();
+            }
+
+            var readSource = (writing || !reading) ? targetVfs : merged;
+            int id = nextHandle++;
+            openHandles[id] = new FileHandle
+            {
+                Path   = npath,
+                Writing = writing,
+                Appending = appending,
+                Pos = appending && readSource.TryGetValue(npath, out var ab) ? ab.Length : 0,
+                Vfs = writing ? targetVfs : null,  // null = use merged for reading
+                MergedVfs = merged,
+            };
+            lock (logLock) { Log($"[fs] open '{path}' {mode} → h{id}"); }
+            return new object[] { (double)id };
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -1069,7 +1503,7 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
         private void RegisterScreen()
         {
             lua.DoString(@"screen = {}");
-            lua["screen.address"] = scrnAddr;
+            lua["screen.address"] = (Func<string>)(() => scrnAddr);
             lua["screen.type"] = "screen";
         }
 
@@ -1079,11 +1513,24 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
             {
                 case "getAspectRatio": return new object[] { 1.0, 1.0 };
                 case "getKeyboards":
-                    var k = NewLuaTable(); k[1] = compAddr;
+                    var k = NewLuaTable(); k[1] = kbdAddr;
                     return new object[] { k };
-                case "isColor": return new object[] { true };
+                case "isColor":   return new object[] { true };
                 case "isPrecise": return new object[] { false };
-                case "setPrecise": return new object[] { false };
+                case "setPrecise":return new object[] { false };
+                case "isOn":      return new object[] { true };
+                case "turnOn":    return new object[] { true };
+                case "turnOff":   return new object[] { true };
+                case "getResolution":
+                    return new object[] { (double)screen.Width, (double)screen.Height };
+                case "setResolution":
+                    if (args.Length >= 2)
+                    {
+                        int nw = Math.Max(1, Math.Min(ToInt(args[0]), props.screenWidth));
+                        int nh = Math.Max(1, Math.Min(ToInt(args[1]), props.screenHeight));
+                        screen.Resize(nw, nh);
+                    }
+                    return new object[] { true };
                 default: return new object[] { null };
             }
         }
@@ -1095,7 +1542,7 @@ function unicode.upper(s) return type(s)=='string' and string.upper(s) or '' end
         private void RegisterEeprom()
         {
             lua.DoString(@"eeprom = {}");
-            lua["eeprom.address"] = eepromAddr;
+            lua["eeprom.address"] = (Func<string>)(() => eepromAddr);
             lua["eeprom.type"] = "eeprom";
         }
 
@@ -1184,13 +1631,14 @@ end
             lua["__vfs_read__"] = (Func<string, string>)(path =>
             {
                 string n = Norm(path);
-                return vfs.TryGetValue(n, out var data)
+                var merged = BuildMergedVfs();
+                return merged.TryGetValue(n, out var data)
                     ? Encoding.UTF8.GetString(data)
                     : null;
             });
 
-            // Expose a C# function that checks if VFS path exists.
-            lua["__vfs_exists__"] = (Func<string, bool>)(path => vfs.ContainsKey(Norm(path)));
+            lua["__vfs_exists__"] = (Func<string, bool>)(path =>
+                BuildMergedVfs().ContainsKey(Norm(path)));
 
             // Начальная реализация require — совместимая с OpenOS.
             // После того как boot.lua загрузит lib/package.lua, она будет перезаписана
@@ -1257,16 +1705,15 @@ end
         private object[] LuaLoadFileSafe(string filename)
         {
             string path = Norm(filename ?? "");
+            var merged = BuildMergedVfs();
 
-            // Handle paths starting with /
-            if (!vfs.ContainsKey(path))
+            if (!merged.ContainsKey(path))
             {
-                // Try stripping leading slash
                 string stripped = path.TrimStart('/');
-                if (vfs.ContainsKey(stripped)) path = stripped;
+                if (merged.ContainsKey(stripped)) path = stripped;
             }
 
-            if (!vfs.TryGetValue(path, out var data))
+            if (!merged.TryGetValue(path, out var data))
             {
                 lock (logLock) { Log($"[loadfile] NOT FOUND: {filename}"); }
                 return new object[] { null, "file not found: " + filename };
@@ -1321,14 +1768,21 @@ end
         {
             Log("[boot] Starting BIOS...");
 
-            if (!vfs.ContainsKey("bios.lua"))
+            // Clear the C# screen buffer so any BIOS splash text (printed during
+            // the boot countdown in Comp_Computer) is gone before the BIOS runs.
+            // Without this, "RimComputers BIOS v1.0 / Booting..." stays visible
+            // in areas the BIOS code doesn't redraw.
+            screen.Clear();
+
+            var merged = BuildMergedVfs();
+            if (!merged.ContainsKey("bios.lua"))
             {
                 Log("[boot] ERROR: bios.lua not found in VFS!");
                 screen.Println("ERROR: No BIOS found!");
                 return;
             }
 
-            string biosCode = Encoding.UTF8.GetString(vfs["bios.lua"]);
+            string biosCode = Encoding.UTF8.GetString(merged["bios.lua"]);
             Log($"[boot] BIOS size: {biosCode.Length} bytes");
             Log("[boot] Compiling BIOS...");
 
@@ -1361,6 +1815,15 @@ end
             Log("[boot] BIOS compiled OK. Pushing init signal...");
             PushSignal("init");
 
+            // Re-inject unicode into _G just before the thread starts.
+            // OpenOS boot scripts may create sub-environments; by doing this
+            // last we ensure it's in the Lua state when the BIOS thread begins.
+            try
+            {
+                lua.DoString("rawset(_G, 'unicode', unicode)");
+            }
+            catch { }
+
             luaThread = new Thread(() =>
             {
                 try
@@ -1380,11 +1843,11 @@ end
                     // Blue screen of death
                     screen.CurrentBG = new Color32(0, 0, 170, 255);
                     screen.CurrentFG = new Color32(255, 255, 255, 255);
-                    screen.Fill(0, 0, props.screenWidth, props.screenHeight, ' ');
-                    string msg = ex.Message.Length > props.screenWidth - 8
-                        ? ex.Message.Substring(0, props.screenWidth - 8)
+                    screen.Fill(0, 0, screen.Width, screen.Height, ' ');
+                    string msg = ex.Message.Length > screen.Width - 8
+                        ? ex.Message.Substring(0, screen.Width - 8)
                         : ex.Message;
-                    screen.Set(0, props.screenHeight / 2, "FATAL: " + msg);
+                    screen.Set(0, screen.Height / 2, "FATAL: " + msg);
                     screen.CurrentBG = new Color32(0, 0, 0, 255);
                 }
                 finally
@@ -1405,6 +1868,12 @@ end
         // Game loop (called from RimWorld tick thread)
         // ════════════════════════════════════════════════════════════════════
 
+        // OC Tier-3 CPU: 20 executions/sec. RimWorld runs at 60 ticks/sec.
+        // We push input signals every tick, but only wake the Lua thread
+        // every 3 ticks (~20Hz) so it matches real OC timing.
+        private int _luaTickAccum = 0;
+        private const int LuaTickInterval = 3; // 60 TPS / 3 = 20Hz
+
         public void Tick()
         {
             if (!running) return;
@@ -1413,16 +1882,18 @@ end
             uptimeSeconds = gameTicks * (1f / 60f);
             ramUsed = (openHandles.Count * 256L) + (signalQueue.Count * 128L) + 8192L;
 
+            // Always drain input from the UI thread into the signal queue.
+            // charCode: OC sends the full Unicode codepoint, not just ASCII.
             while (InputBuffer.TryDequeueKeyDown(out char kc, out int sc))
             {
-                double charCode = (kc >= 32 && kc <= 127) ? (double)kc : 0.0;
-                PushSignal("key_down", compAddr, charCode, (double)sc, compAddr);
+                double charCode = kc >= 32 ? (double)kc : 0.0;
+                PushSignal("key_down", kbdAddr, charCode, (double)sc, kbdAddr);
             }
 
             while (InputBuffer.TryDequeueKeyUp(out char ku, out int su))
             {
-                double charCode = (ku >= 32 && ku <= 127) ? (double)ku : 0.0;
-                PushSignal("key_up", compAddr, charCode, (double)su, compAddr);
+                double charCode = ku >= 32 ? (double)ku : 0.0;
+                PushSignal("key_up", kbdAddr, charCode, (double)su, kbdAddr);
             }
 
             // Play beeps on game thread (Unity audio API is main-thread only)
@@ -1435,6 +1906,25 @@ end
                     beep = _beepQueue.Dequeue();
                 }
                 PlayBeep(beep.freq, beep.dur);
+            }
+
+            // Throttle Lua wakeups to ~20Hz so the computer doesn't run
+            // at unbounded speed. The Lua thread sleeps in pullSignal until
+            // we release the semaphore here.
+            _luaTickAccum++;
+            if (_luaTickAccum >= LuaTickInterval)
+            {
+                _luaTickAccum = 0;
+                // Release one extra semaphore slot to wake pullSignal for the
+                // next "clock" tick. This simulates the OC 20Hz interrupt.
+                // Only release if nothing is already queued (avoid pileup).
+                lock (signalLock)
+                {
+                    if (signalQueue.Count == 0)
+                    {
+                        try { signalReady.Release(); } catch { }
+                    }
+                }
             }
         }
 
@@ -1477,14 +1967,14 @@ end
         public void PushKeySignal(char ch, KeyCode keyCode)
         {
             double charCode = (ch >= 32 && ch <= 127) ? (double)ch : 0.0;
-            PushSignal("key_down", compAddr, charCode, (double)keyCode, compAddr);
-            PushSignal("key_up", compAddr, charCode, (double)keyCode, compAddr);
+            PushSignal("key_down", kbdAddr, charCode, (double)keyCode, kbdAddr);
+            PushSignal("key_up", kbdAddr, charCode, (double)keyCode, kbdAddr);
         }
 
         public void PushClipboardSignal(string text)
         {
             if (!string.IsNullOrEmpty(text))
-                PushSignal("clipboard", scrnAddr, text, compAddr);
+                PushSignal("clipboard", kbdAddr, text, kbdAddr);
         }
 
         public void ExecuteLua(string code)
@@ -1501,16 +1991,9 @@ end
         /// <summary>
         /// Returns all VFS entries that are NOT original ROM files.
         /// These are files created or modified by OpenOS at runtime.
-        /// Comp_Computer serialises this dictionary to the save game.
-        /// </summary>
-        public Dictionary<string, byte[]> GetWriteableVfsSnapshot()
-        {
-            var result = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in vfs)
-                if (!romKeys.Contains(kv.Key))
-                    result[kv.Key] = kv.Value;
-            return result;
-        }
+        /// <summary>Returns hddVfs snapshot (backward compat for legacy callers).</summary>
+        public Dictionary<string, byte[]> GetWriteableVfsSnapshot() =>
+            new Dictionary<string, byte[]>(hddVfs, StringComparer.OrdinalIgnoreCase);
 
         // ════════════════════════════════════════════════════════════════════
         // Dispose
@@ -1558,20 +2041,81 @@ end
         // Helpers
         // ════════════════════════════════════════════════════════════════════
 
-        private void EnsureDir(string p)
+        private void EnsureDir(string p, Dictionary<string, byte[]> target = null)
         {
             string m = Norm(p) + "/.dir";
-            if (!vfs.ContainsKey(m)) vfs[m] = Array.Empty<byte>();
+            var v = target ?? hddVfs;
+            if (!v.ContainsKey(m)) { v[m] = Array.Empty<byte>(); InvalidateMergedVfs(); }
         }
 
-        private void WriteText(string path, string text)
-            => vfs[Norm(path)] = Encoding.UTF8.GetBytes(text);
+        private void WriteText(string path, string text,
+            Dictionary<string, byte[]> target = null)
+        {
+            var v = target ?? hddVfs;
+            v[Norm(path)] = Encoding.UTF8.GetBytes(text);
+            InvalidateMergedVfs();
+        }
+
+        // ── VFS ↔ real folder sync ─────────────────────────────────────────────
+
+        private static void LoadFolderToVfs(string folder,
+            Dictionary<string, byte[]> target)
+        {
+            foreach (var file in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
+            {
+                string rel = file.Substring(folder.Length).TrimStart(Path.DirectorySeparatorChar,
+                                                                       Path.AltDirectorySeparatorChar)
+                                  .Replace('\\', '/');
+                try { target[rel] = File.ReadAllBytes(file); }
+                catch { /* skip locked files */ }
+            }
+        }
+
+        /// <summary>Flush hddVfs to the real HDD folder on disk.</summary>
+        public void FlushHddToFolder()
+        {
+            if (string.IsNullOrEmpty(hddFolderPath)) return;
+            try
+            {
+                Directory.CreateDirectory(hddFolderPath);
+                // Write all files
+                foreach (var kv in hddVfs)
+                {
+                    if (kv.Key.EndsWith("/.dir")) continue; // skip dir markers
+                    string fullPath = Path.Combine(hddFolderPath,
+                        kv.Key.Replace('/', Path.DirectorySeparatorChar));
+                    Directory.CreateDirectory(Path.GetDirectoryName(fullPath));
+                    File.WriteAllBytes(fullPath, kv.Value);
+                }
+                Log($"[hdd] Flushed {hddVfs.Count} entries to {hddFolderPath}");
+            }
+            catch (Exception ex) { Log($"[hdd] Flush error: {ex.Message}"); }
+        }
 
         private string Norm(string p)
             => (p ?? "").Replace('\\', '/').TrimStart('/');
 
         private static string NewGuid8()
-            => Guid.NewGuid().ToString("N").Substring(0, 8);
+            => Guid.NewGuid().ToString(); // full UUID: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (36 chars)
+
+        /// <summary>
+        /// Creates a stable 36-char UUID from a seed string + role tag.
+        /// Same input always produces the same output, so component addresses
+        /// survive reboots and the eeprom boot address remains valid.
+        /// </summary>
+        private static string DeterministicGuid(string seed, string role)
+        {
+            // Use MD5 of seed+role as UUID bytes
+            using var md5 = System.Security.Cryptography.MD5.Create();
+            byte[] input = System.Text.Encoding.UTF8.GetBytes(seed + ":" + role);
+            byte[] hash = md5.ComputeHash(input);
+            // Format as RFC-4122 UUID string
+            return $"{hash[0]:x2}{hash[1]:x2}{hash[2]:x2}{hash[3]:x2}-" +
+                   $"{hash[4]:x2}{hash[5]:x2}-" +
+                   $"{hash[6]:x2}{hash[7]:x2}-" +
+                   $"{hash[8]:x2}{hash[9]:x2}-" +
+                   $"{hash[10]:x2}{hash[11]:x2}{hash[12]:x2}{hash[13]:x2}{hash[14]:x2}{hash[15]:x2}";
+        }
 
         private static int _tmpCounter;
         private LuaTable NewLuaTable()
@@ -1616,7 +2160,8 @@ end
             {
                 string entry = "[" + (Find.TickManager?.TicksGame ?? 0) + "] " + msg;
                 log.Add(entry);
-                if (log.Count > 2000) log.RemoveAt(0);
+                // Keep last 10 000 entries — enough for long sessions, not a memory leak.
+                if (log.Count > 10000) log.RemoveAt(0);
             }
         }
     }

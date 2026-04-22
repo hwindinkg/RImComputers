@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.IO;
 using RimWorld;
 using UnityEngine;
 using Verse;
@@ -9,43 +10,57 @@ namespace RimComputers
     public class Comp_Computer : ThingComp
     {
         private ComputerState state = ComputerState.Off;
-        private ScreenBuffer screen;
-        private OCApi ocApi;
-        private List<string> debugLog = new List<string>();
+        private ScreenBuffer  screen;
+        private OCApi         ocApi;
+        private List<string>  debugLog = new List<string>();
 
-        private int bootTicksLeft = 0;
+        private int   bootTicksLeft = 0;
         private const int BootTicks = 60;
 
-        // ── Persistent writable VFS ──────────────────────────────────────────
-        // ROM files are re-loaded each boot from disk (read-only source of truth).
-        // Files created/modified by OpenOS at runtime are stored here and survive
-        // reboots and save/load cycles.
-        // Key   = normalised VFS path (no leading /)
-        // Value = UTF-8 bytes encoded as Base64 for XML serialisation
+        // ── Internet card ────────────────────────────────────────────────────
+        private bool internetEnabled = false;
+
+        // ── Legacy XML-based VFS (for migration only) ────────────────────────
+        // New installs use HddFolderPath. Old saves have data here; on first boot
+        // we migrate it to the folder and clear this dict.
         private Dictionary<string, string> persistentVfsB64 =
             new Dictionary<string, string>();
 
-        // ── Pending reboot flag ──────────────────────────────────────────────
-        // Set by OCApi when computer.shutdown(true) is called from Lua.
-        // Checked each game tick to schedule a clean reboot via the game thread.
-        private volatile bool _pendingReboot = false;
+        // ── Reboot/shutdown flags (set from Lua thread) ──────────────────────
+        private volatile bool _pendingReboot   = false;
         private volatile bool _pendingShutdown = false;
 
+        // ── Public accessors ─────────────────────────────────────────────────
         public CompProperties_Computer Props => (CompProperties_Computer)props;
         private CompPowerTrader PowerComp => parent.TryGetComp<CompPowerTrader>();
-        public bool HasPower => PowerComp == null || PowerComp.PowerOn;
-
+        public bool HasPower  => PowerComp == null || PowerComp.PowerOn;
         public ComputerState State => state;
-        public ScreenBuffer Screen => screen;
-        public List<string> DebugLog => debugLog;
+        public ScreenBuffer  Screen => screen;
+        public List<string>  DebugLog => debugLog;
         public long RamUsed => ocApi?.RamUsed ?? 0L;
         public long RomUsed => ocApi?.RomUsed ?? 0L;
         public string LuaVerString => "NLua/5.3";
+
+        // ── HDD folder ───────────────────────────────────────────────────────
+        // Stored on the real file system alongside the save game.
+        // Path: <SaveFolder>/RimComputers/<ThingID>/hdd/
+        private string HddFolderPath =>
+            Path.Combine(
+                GenFilePaths.SaveDataFolderPath,
+                "RimComputers",
+                parent.ThingID ?? "unknown",
+                "hdd");
+
+        // ════════════════════════════════════════════════════════════════════
+        // Life-cycle
+        // ════════════════════════════════════════════════════════════════════
 
         public override void PostSpawnSetup(bool respawningAfterLoad)
         {
             base.PostSpawnSetup(respawningAfterLoad);
             screen = new ScreenBuffer(Props.screenWidth, Props.screenHeight);
+            // Ensure the HDD folder exists
+            Directory.CreateDirectory(HddFolderPath);
             if (state == ComputerState.Running)
                 InitLua();
         }
@@ -60,13 +75,12 @@ namespace RimComputers
                 return;
             }
 
-            // ── Handle reboot/shutdown requested by Lua via computer.shutdown() ──
             if (_pendingShutdown)
             {
                 _pendingShutdown = false;
-                _pendingReboot = false;
+                _pendingReboot   = false;
                 Log("[tick] Lua requested shutdown");
-                FlushVfsFromApi();
+                FlushHdd();
                 ForceOff("Lua shutdown");
                 return;
             }
@@ -74,9 +88,8 @@ namespace RimComputers
             {
                 _pendingReboot = false;
                 Log("[tick] Lua requested reboot");
-                FlushVfsFromApi();
+                FlushHdd();
                 ForceOff("Lua reboot");
-                // Start fresh boot cycle
                 state = ComputerState.Booting;
                 bootTicksLeft = BootTicks;
                 screen.Clear();
@@ -90,19 +103,18 @@ namespace RimComputers
                 return;
             }
             if (state == ComputerState.Running)
-            {
                 ocApi?.Tick();
-            }
         }
 
-        // Called by OCApi when computer.shutdown(reboot) fires from Lua thread
         public void RequestShutdown(bool reboot)
         {
-            if (reboot)
-                _pendingReboot = true;
-            else
-                _pendingShutdown = true;
+            if (reboot) _pendingReboot   = true;
+            else        _pendingShutdown = true;
         }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Power
+        // ════════════════════════════════════════════════════════════════════
 
         public void TryPowerOn()
         {
@@ -120,7 +132,7 @@ namespace RimComputers
         public void TryPowerOff()
         {
             if (state == ComputerState.Off) return;
-            FlushVfsFromApi();
+            FlushHdd();
             ForceOff("User shutdown");
         }
 
@@ -149,8 +161,28 @@ namespace RimComputers
             try
             {
                 Log("InitLua start");
-                var persistentVfs = DeserialiseVfs();
-                ocApi = new OCApi(screen, Props, debugLog, parent, persistentVfs, this);
+                screen.Clear();
+
+                // Migrate old XML-based VFS to HDD folder on first boot after update
+                Dictionary<string, byte[]> legacyMigration = null;
+                if (persistentVfsB64 != null && persistentVfsB64.Count > 0)
+                {
+                    legacyMigration = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in persistentVfsB64)
+                    {
+                        try { legacyMigration[kv.Key] = Convert.FromBase64String(kv.Value); }
+                        catch { }
+                    }
+                    persistentVfsB64.Clear(); // migration done — don't re-use
+                }
+
+                ocApi = new OCApi(screen, Props, debugLog, parent,
+                                  hddFolderPath:     HddFolderPath,
+                                  legacyVfsMigration: legacyMigration,
+                                  compComp:           this);
+
+                if (internetEnabled) ocApi.SetInternetEnabled(true);
+
                 Log("OCApi created, starting BIOS");
                 ocApi.StartBios();
                 Log("InitLua OK");
@@ -159,7 +191,7 @@ namespace RimComputers
             {
                 state = ComputerState.Error;
                 Log("Lua init error: " + ex.Message);
-                Log("Lua init stack: " + ex.StackTrace?.Substring(0, 500));
+                Log("Lua init stack: " + ex.StackTrace?.Substring(0, Math.Min(500, ex.StackTrace?.Length ?? 0)));
                 Verse.Log.Error("[RimComputers] InitLua: " + ex);
                 screen.Println("INIT ERROR: " + ex.Message);
             }
@@ -171,27 +203,15 @@ namespace RimComputers
             ocApi = null;
         }
 
-        // Snapshot writable VFS from the running OCApi into persistentVfsB64.
-        private void FlushVfsFromApi()
+        /// <summary>Flush HDD VFS to disk folder.</summary>
+        private void FlushHdd()
         {
-            if (ocApi == null) return;
-            var writeable = ocApi.GetWriteableVfsSnapshot();
-            persistentVfsB64.Clear();
-            foreach (var kv in writeable)
-                persistentVfsB64[kv.Key] = Convert.ToBase64String(kv.Value);
-            Log($"[vfs] flushed {persistentVfsB64.Count} writable entries");
+            ocApi?.FlushHddToFolder();
         }
 
-        private Dictionary<string, byte[]> DeserialiseVfs()
-        {
-            var result = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in persistentVfsB64)
-            {
-                try { result[kv.Key] = Convert.FromBase64String(kv.Value); }
-                catch { /* corrupt entry — skip */ }
-            }
-            return result;
-        }
+        // ════════════════════════════════════════════════════════════════════
+        // Public helpers
+        // ════════════════════════════════════════════════════════════════════
 
         public string ExecLua(string code)
         {
@@ -217,7 +237,7 @@ namespace RimComputers
             lock (debugLog)
             {
                 debugLog.Add("[" + (Find.TickManager?.TicksGame ?? 0) + "] " + msg);
-                if (debugLog.Count > 2000) debugLog.RemoveAt(0);
+                if (debugLog.Count > 10000) debugLog.RemoveAt(0);
             }
         }
 
@@ -227,51 +247,112 @@ namespace RimComputers
             TryPowerOn();
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Gizmos
+        // ════════════════════════════════════════════════════════════════════
+
         public override IEnumerable<Gizmo> CompGetGizmosExtra()
         {
+            // ── Toggle screen ─────────────────────────────────────────────
             yield return new Command_Action
             {
                 defaultLabel = "Toggle Screen",
-                defaultDesc = "Open or close terminal.",
+                defaultDesc  = "Open or close the terminal window.",
                 icon = ContentFinder<Texture2D>.Get("UI/Commands/LaunchReport", true),
                 action = () =>
                 {
                     var existing = Find.WindowStack.WindowOfType<Dialog_ComputerScreen>();
-                    if (existing != null)
-                        existing.Close();
-                    else
-                        Find.WindowStack.Add(new Dialog_ComputerScreen(this));
+                    if (existing != null) existing.Close();
+                    else Find.WindowStack.Add(new Dialog_ComputerScreen(this));
                 }
             };
+
+            // ── Power on/off ──────────────────────────────────────────────
             bool isOn = state != ComputerState.Off;
             yield return new Command_Action
             {
                 defaultLabel = isOn ? "Power Off" : "Power On",
-                defaultDesc = "",
+                defaultDesc  = "",
                 icon = ContentFinder<Texture2D>.Get("UI/Commands/Halt", true),
                 action = () => { if (isOn) TryPowerOff(); else TryPowerOn(); }
             };
+
+            // ── Internet card ─────────────────────────────────────────────
+            yield return new Command_Action
+            {
+                defaultLabel = internetEnabled ? "Internet: ON" : "Internet: OFF",
+                defaultDesc  = internetEnabled
+                    ? "Internet card enabled. Click to disable."
+                    : "Internet card disabled. Click to enable (wget, pastebin, MineOS installer…)",
+                icon = ContentFinder<Texture2D>.Get("UI/Commands/AttackMelee", true),
+                action = () =>
+                {
+                    internetEnabled = !internetEnabled;
+                    ocApi?.SetInternetEnabled(internetEnabled);
+                    Log($"[gizmo] Internet: {internetEnabled}");
+                }
+            };
+
+            // ── HDD folder ────────────────────────────────────────────────
+            yield return new Command_Action
+            {
+                defaultLabel = "Open HDD Folder",
+                defaultDesc  = $"Open the HDD data folder in Explorer:\n{HddFolderPath}",
+                icon = ContentFinder<Texture2D>.Get("UI/Commands/ViewQuest", true),
+                action = () =>
+                {
+                    Directory.CreateDirectory(HddFolderPath);
+                    System.Diagnostics.Process.Start(HddFolderPath);
+                }
+            };
+
+            // ── Debug log ─────────────────────────────────────────────────
             yield return new Command_Action
             {
                 defaultLabel = "Debug Log",
-                defaultDesc = "Open debug console.",
+                defaultDesc  = "Open the debug console.",
                 icon = ContentFinder<Texture2D>.Get("UI/Commands/ViewQuest", true),
                 action = () => Find.WindowStack.Add(new Dialog_ComputerDebug(this))
             };
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Inspect string
+        // ════════════════════════════════════════════════════════════════════
+
         public override string CompInspectStringExtra()
-            => $"State: {state}  Lua: {LuaVerString}\nRAM: {RamUsed / 1024}KB  ROM: {RomUsed / 1024}KB";
+        {
+            string hddInfo = "";
+            try
+            {
+                if (Directory.Exists(HddFolderPath))
+                {
+                    int fc = Directory.GetFiles(HddFolderPath, "*", SearchOption.AllDirectories).Length;
+                    hddInfo = $"  HDD: {fc} files";
+                }
+            }
+            catch { }
+            return $"State: {state}  Lua: {LuaVerString}\n" +
+                   $"RAM: {RamUsed/1024}KB  ROM: {RomUsed/1024}KB  " +
+                   $"Net: {(internetEnabled?"ON":"OFF")}{hddInfo}";
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Save/Load
+        // ════════════════════════════════════════════════════════════════════
 
         public override void PostExposeData()
         {
             base.PostExposeData();
-            Scribe_Values.Look(ref state, "rcState", ComputerState.Off);
+            Scribe_Values.Look(ref state,           "rcState",           ComputerState.Off);
+            Scribe_Values.Look(ref internetEnabled, "rcInternetEnabled", false);
 
-            // Flush before saving so latest changes are included
+            // Flush HDD to disk before saving (so the folder is up-to-date)
             if (Scribe.mode == LoadSaveMode.Saving)
-                FlushVfsFromApi();
+                FlushHdd();
 
+            // Keep the old XML VFS dict around only for migration of old saves.
+            // New saves will have an empty dict here.
             Scribe_Collections.Look(ref persistentVfsB64, "rcVfs",
                 LookMode.Value, LookMode.Value);
 
