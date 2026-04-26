@@ -6,6 +6,10 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using NLua;
+// NOTE: do NOT `using KeraLua;` — both NLua and KeraLua expose `Lua` and
+// `LuaFunction` types and we end up with CS0104 ambiguity. We only need
+// KeraLua's `Lua` / `LuaFunction` / `LuaType` in two places (the raw
+// fs.read/write CFunctions); fully-qualified `KeraLua.X` is fine there.
 using UnityEngine;
 using Verse;
 
@@ -78,13 +82,38 @@ namespace RimComputers
         // Component addresses
         private readonly string gpuAddr, scrnAddr, eepromAddr, compAddr, kbdAddr;
         private readonly string romAddr;   // ROM floppy (read-only)
-        private readonly string hddAddr;   // HDD (writable)
+        private readonly string hddAddr;   // HDD (writable, persisted)
+        private readonly string tmpAddr;   // tmpfs (writable, in-memory only)
         // fsAddr kept for backward-compat routing — points to hddAddr
         private string fsAddr => hddAddr;
+
+        // tmpfs: small in-memory writable filesystem mounted at /tmp.
+        // Real OC always exposes a tmpfs as a separate filesystem component
+        // distinct from the HDD; OpenOS's `install` command, mounting logic
+        // (90_filesystem.lua) and shutdown handler all key on the
+        // computer.tmpAddress() return value to *exclude* that filesystem
+        // from being treated as a regular disk. Previously we returned the
+        // HDD address from tmpAddress(), which made install reject the HDD
+        // as a target ("No writable disks found, aborting"). Now tmpfs has
+        // its own separate address and VFS, and HDD is a regular disk.
+        private readonly Dictionary<string, byte[]> tmpVfs =
+            new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         private string internetAddr; // null when internet card is disabled
 
         // Internet card state (toggled via gizmo)
         private volatile bool internetEnabled = false;
+
+        // ── GPU off-screen buffer state ─────────────────────────────────────
+        // MineOS uses gpu.allocateBuffer / setActiveBuffer / bitblt for double
+        // buffering. Our implementation is a stub: every "buffer" reports the
+        // screen size and bitblt is a no-op (writes already went to the main
+        // screen). Tracking just the indices is enough to satisfy MineOS's
+        // "is this buffer still alive?" checks and avoid the
+        // "attempt to compare number with nil" error in drawImage.
+        private int _gpuBufferNextIdx = 0;
+        private int _gpuActiveBuffer  = 0; // 0 = main screen
+        private readonly Dictionary<int, (int w, int h)> _gpuBufferSizes
+            = new Dictionary<int, (int, int)>();
 
         // Per-computer BIOS code (eeprom.get / eeprom.set — ~4 KB Lua source).
         private string _biosCode;
@@ -131,12 +160,43 @@ namespace RimComputers
         }
 
         // Timing
-        private float uptimeSeconds = 0f;
+        //
+        // `uptimeSeconds` must be consistent with how long `os.sleep` / `pullSignal`
+        // actually block. Previously it was tied to `Find.TickManager.TicksGame`,
+        // which advances 3× faster on 3× game speed and stops when the game is
+        // paused — while our signalReady.Wait() always sleeps in *real* wall‑clock
+        // milliseconds. That mismatch made e.g. IcePlayer run 2–3× too fast on
+        // fast‑forward (uptime deadline is reached long before the wall‑clock
+        // sleep returns). We now measure wall‑clock time since boot via a
+        // Stopwatch, which matches wall‑clock sleeping exactly.
+        private readonly System.Diagnostics.Stopwatch _uptime =
+            System.Diagnostics.Stopwatch.StartNew();
+        private double uptimeSeconds => _uptime.Elapsed.TotalSeconds;
 
         // File handles
         private int nextHandle = 1;
         private readonly Dictionary<int, FileHandle> openHandles =
             new Dictionary<int, FileHandle>();
+
+        // Native CFunctions for byte-preserving I/O.
+        //
+        // NLua marshals strings as UTF-8 in *both* directions, which is fatal
+        // for binary file I/O. e.g. IcePlayer's bad.ice header byte 0xA0 (=160)
+        // gets re-encoded through UTF-8 → garbled → finally decoded as "?"
+        // (=63), which is why setResolution(W,H) was being called with
+        // setResolution(63, 50) instead of setResolution(160, 50). Likewise
+        // MineOS install writes binary downloads through fs.write and they end
+        // up corrupt for the same reason.
+        //
+        // KeraLua's PushBuffer / ToBuffer push/pop raw bytes via lua_pushlstring
+        // and lua_tolstring without any encoding conversion. We register two
+        // CFunctions that do byte-faithful read/write and route the proxy's
+        // fs:read / fs:write calls through them, keeping every other field
+        // unchanged. The delegates are kept in fields so the GC can't collect
+        // them while the Lua state still has pointers.
+        private KeraLua.LuaFunction _fsReadRawFn;
+        private KeraLua.LuaFunction _fsWriteRawFn;
+        private KeraLua.LuaFunction _inetReadRawFn;
 
         // Memory tracking
         private long ramUsed = 0, romUsed = 0;
@@ -206,6 +266,7 @@ namespace RimComputers
             scrnAddr   = DeterministicGuid(baseId, "screen");
             romAddr    = DeterministicGuid(baseId, "rom");
             hddAddr    = DeterministicGuid(baseId, "hdd");
+            tmpAddr    = DeterministicGuid(baseId, "tmp");
             eepromAddr = DeterministicGuid(baseId, "eeprom");
             compAddr   = DeterministicGuid(baseId, "computer");
             kbdAddr    = DeterministicGuid(baseId, "keyboard");
@@ -218,6 +279,28 @@ namespace RimComputers
 
             // ── Per-computer BIOS ─────────────────────────────────────────────
             // Use saved BIOS if this computer was previously flashed; else default.
+            //
+            // Defensive: in pre-v4 builds, eeprom.set and eeprom.setData both
+            // wrote to _savedBiosCode, so OpenOS's `setBootAddress(addr)`
+            // routinely clobbered the BIOS with a 36-byte filesystem UUID.
+            // Detect that case (looks-like-UUID and obviously not Lua source)
+            // and fall back to the default BIOS, so old saves don't need a
+            // manual "Reset BIOS to Default" press to recover.
+            bool savedLooksCorrupt =
+                !string.IsNullOrEmpty(savedBiosCode) &&
+                savedBiosCode.Length <= 64 &&
+                !savedBiosCode.Contains("\n") &&
+                !savedBiosCode.Contains(";") &&
+                !savedBiosCode.Contains("=") &&
+                !savedBiosCode.Contains("(");
+            if (savedLooksCorrupt)
+            {
+                Log($"[OCApi] saved BIOS looks corrupt ({savedBiosCode.Length}B, no Lua syntax) — falling back to default");
+                savedBiosCode = null;
+                // Tell Comp_Computer to drop the corrupt blob so it isn't
+                // reapplied on next reboot.
+                compComp?.OnBiosFlashed(null);
+            }
             _biosCode = !string.IsNullOrEmpty(savedBiosCode)
                 ? savedBiosCode
                 : defaultBios ?? RomLoader.BuiltinBiosStub;
@@ -386,8 +469,13 @@ end
             // ── computer table ───────────────────────────────────────────────
             lua.DoString(@"computer = {}");
             lua["computer.address"] = new Func<string>(() => compAddr);
-            // tmpAddress ДОЛЖНА быть функцией — OpenOS вызывает computer.tmpAddress()
-            lua["computer.tmpAddress"] = (Func<string>)(() => fsAddr);
+            // tmpAddress ДОЛЖНА быть функцией — OpenOS вызывает computer.tmpAddress().
+            // Real OC returns the *tmpfs* address (a separate filesystem from
+            // the HDD). OpenOS install/mount logic uses this to *exclude* the
+            // tmpfs from regular disk handling. Returning fsAddr (=hdd) made
+            // install say "No writable disks found" because it filtered out
+            // the only writable disk we exposed.
+            lua["computer.tmpAddress"] = (Func<string>)(() => tmpAddr);
             lua["computer.totalMemory"] = (Func<long>)(() => effectiveRamBytes);
             lua["computer.freeMemory"] = (Func<long>)(() => effectiveRamBytes - ramUsed);
             lua["computer.uptime"] = (Func<double>)(() => (double)uptimeSeconds);
@@ -470,22 +558,28 @@ end
             lua["os.sleep"] = (Action<double>)(secs =>
             {
                 // Real OC os.sleep blocks via pullSignal with a timeout.
-                // We replicate that: wait up to 'secs' seconds on the semaphore
-                // (draining and discarding any signals that arrive).
+                // We wait up to 'secs' REAL seconds on the semaphore,
+                // draining and discarding any signals that wake us early.
+                //
+                // Uses a wall‑clock deadline instead of accumulating the
+                // requested chunk size — previously each early wakeup counted
+                // the full 50 ms chunk towards `elapsed`, so sleeps finished
+                // far too soon (this is why IcePlayer ran 2–3× too fast).
                 if (secs <= 0) return;
                 int totalMs = Math.Min((int)(secs * 1000), 300_000); // cap 5 min
-                int elapsed  = 0;
+                long deadline = Environment.TickCount + totalMs;
                 const int chunk = 50;
-                while (running && elapsed < totalMs)
+                while (running)
                 {
-                    int wait = Math.Min(chunk, totalMs - elapsed);
+                    int remaining = unchecked((int)(deadline - Environment.TickCount));
+                    if (remaining <= 0) break;
+                    int wait = Math.Min(chunk, remaining);
                     signalReady.Wait(wait);
                     // Drain any signals that woke us so they don't pile up.
                     lock (signalLock)
                     {
                         while (signalQueue.Count > 0) signalQueue.Dequeue();
                     }
-                    elapsed += wait;
                 }
             });
             lua["os.setenv"] = (Action<string, object>)((k, v) => { });
@@ -593,37 +687,52 @@ end
             RegisterEeprom();
 
             // ── Internet response read/close helpers ──────────────────────────
-            lua["__inet_read__"] = (Func<double, string>)(hid =>
+            // Raw byte-preserving inet read. Same UTF-8 marshalling problem
+            // as fs.read had pre-v5f1: NLua's `Func<double,string>` round-trips
+            // through `Encoding.UTF8.GetString` in both directions, so any
+            // byte that isn't valid UTF-8 (e.g. binary image data inside a
+            // .pic file MineOS downloads, or a tinyurl HTML 30x redirect
+            // body containing 0x80-0xFF bytes) becomes 0xEF 0xBF 0xBD or
+            // a literal '?' (0x3F) by the time Lua's `:byte()` sees it.
+            // The downloaded MineOS installer's drawImage then compares
+            // a corrupted byte against a real number and crashes with
+            // `attempt to compare number with nil`.
+            //
+            // Use a KeraLua CFunction with PushBuffer to push raw bytes
+            // straight to the Lua stack — no encoding round-trip.
+            _inetReadRawFn = new KeraLua.LuaFunction(luaStatePtr =>
             {
-                int id = (int)hid;
-                if (!_internetResponses.TryGetValue(id, out var state)) return null;
+                ThrottleInvokeCall();
+                var L = KeraLua.Lua.FromIntPtr(luaStatePtr);
+                int id = (int)L.ToInteger(1);
+                if (!_internetResponses.TryGetValue(id, out var state))
+                {
+                    L.PushNil();
+                    return 1;
+                }
                 if (state.pos >= state.data.Length)
                 {
                     _internetResponses.Remove(id);
-                    return null; // EOF
+                    L.PushNil();
+                    return 1; // EOF
                 }
                 int chunk = Math.Min(2048, state.data.Length - state.pos);
-                string part = state.data.Substring(state.pos, chunk);
+                byte[] part = new byte[chunk];
+                Buffer.BlockCopy(state.data, state.pos, part, 0, chunk);
                 _internetResponses[id] = (state.data, state.pos + chunk);
-                return part;
+                L.PushBuffer(part);
+                return 1;
             });
+            lua.State.Register("__inet_read_raw__", _inetReadRawFn);
+
             lua["__inet_close__"] = (Action<double>)(hid =>
             {
                 _internetResponses.Remove((int)hid);
             });
-            lua["__inet_response__"] = (Func<double, string>)(hid =>
-            {
-                // Return full response at once (simpler for wget/pastebin usage)
-                int id = (int)hid;
-                if (!_internetResponses.TryGetValue(id, out var state)) return null;
-                string all = state.data;
-                _internetResponses.Remove(id);
-                return all;
-            });
             // Wrap the internet handle table with proper read/close methods
             lua.DoString(@"
 do
-    local _inet_read  = __inet_read__
+    local _inet_read  = __inet_read_raw__
     local _inet_close = __inet_close__
     -- Called by InvokeInternet to wrap a response into an OC-compatible handle
     -- internet.lua calls: request.read() and request.close() (no colon)
@@ -764,6 +873,14 @@ end
 
             lua.DoString(@"
 component.invoke = function(addr, method, ...)
+    -- Filesystem read/write must preserve raw bytes. See proxy below.
+    if method == 'read' or method == 'write' then
+        local t = __comp_type_raw__(addr)
+        if t == 'filesystem' then
+            if method == 'read'  then return __fs_read_raw__(...)  end
+            if method == 'write' then return __fs_write_raw__(...) end
+        end
+    end
     local args = table.pack(...)
     local tbl = {}
     for i = 1, args.n do tbl[i] = args[i] end
@@ -783,6 +900,9 @@ end
             lua["__comp_avail_raw__"] = (Func<string, bool>)ComponentAvailable;
             lua["__comp_address_raw__"] = (Func<string>)(() => compAddr);
 
+            // Register the byte-faithful fs.read / fs.write CFunctions.
+            RegisterRawFsIO();
+
             lua.DoString(@"
 component.type = function(addr)   return __comp_type_raw__(addr) end
 component.isAvailable = function(t) return __comp_avail_raw__(t) end
@@ -796,7 +916,18 @@ component.proxy = function(addr)
     if not t then return nil end
     -- Захватываем invoke-функцию прямо сейчас, не через component.invoke
     local _invoke_raw = __comp_invoke_raw__
+    local _fs_read_raw  = __fs_read_raw__
+    local _fs_write_raw = __fs_write_raw__
     local function invoke_method(method, ...)
+        -- Filesystem read/write must preserve raw bytes — NLua converts
+        -- strings via UTF-8 in both directions, which corrupts arbitrary
+        -- binary data (e.g. an 0xA0 byte in IcePlayer's bad.ice header
+        -- becomes a literal '?'). The CFunctions push/pop bytes directly
+        -- via lua_pushlstring / lua_tolstring, so they round-trip.
+        if t == 'filesystem' then
+            if method == 'read'  then return _fs_read_raw(...) end
+            if method == 'write' then return _fs_write_raw(...) end
+        end
         local args = table.pack(...)
         local tbl = {}
         for i = 1, args.n do tbl[i] = args[i] end
@@ -827,6 +958,51 @@ component.getPrimary = function(t)
     return nil
 end
 ");
+
+            // ── print() / error() hooks ──────────────────────────────────────
+            // Mirror everything the Lua code prints to the host debug log.
+            // MineOS / OpenOS BIOSes commonly use xpcall(boot, errorHandler)
+            // and the errorHandler does `print(traceback)` before drawing the
+            // error to the screen. Our C# `try/catch` around biosFn.Call()
+            // never sees these errors because they're handled inside Lua. By
+            // funnelling Lua's print to our log we get the full traceback
+            // without modifying the user's BIOS.
+            lua["__host_log__"] = (Action<string>)(s =>
+            {
+                if (s == null) return;
+                lock (logLock)
+                {
+                    foreach (var line in s.Split('\n'))
+                        Log("[lua] " + line.TrimEnd('\r'));
+                }
+            });
+            lua.DoString(@"
+local _native_print = print
+print = function(...)
+    local n = select('#', ...)
+    local parts = {}
+    for i = 1, n do parts[i] = tostring((select(i, ...))) end
+    local s = table.concat(parts, '\t')
+    pcall(__host_log__, s)
+    if _native_print then return _native_print(...) end
+end
+");
+
+            // Wrap io.stderr:write / io.write so error chunks (including
+            // MineOS BIOS's traceback dumps) reach the host log even if the
+            // BIOS bypasses print().
+            lua.DoString(@"
+if io and io.write then
+    local _native_io_write = io.write
+    io.write = function(...)
+        local n = select('#', ...)
+        local parts = {}
+        for i = 1, n do parts[i] = tostring((select(i, ...))) end
+        pcall(__host_log__, '[io.write] ' .. table.concat(parts, ''))
+        return _native_io_write(...)
+    end
+end
+");
         }
 
         // Returns flat {[addr]=type} table for all matching components.
@@ -840,7 +1016,8 @@ end
                 (gpuAddr,    "gpu"),
                 (scrnAddr,   "screen"),
                 (romAddr,    "filesystem"),   // ROM floppy (read-only)
-                (hddAddr,    "filesystem"),   // HDD (writable)
+                (hddAddr,    "filesystem"),   // HDD (writable, persisted)
+                (tmpAddr,    "filesystem"),   // tmpfs (writable, in-memory)
                 (eepromAddr, "eeprom"),
                 (kbdAddr,    "keyboard"),
                 (compAddr,   "computer"),
@@ -870,6 +1047,7 @@ end
             if (addr == scrnAddr)   return "screen";
             if (addr == romAddr)    return "filesystem";
             if (addr == hddAddr)    return "filesystem";
+            if (addr == tmpAddr)    return "filesystem";
             if (addr == eepromAddr) return "eeprom";
             if (addr == kbdAddr)    return "keyboard";
             if (addr == compAddr)   return "computer";
@@ -891,11 +1069,39 @@ end
             "setBackgroundColor","getBackground","getForeground","getScreen",
             "getCursor","setCursor","cursorBlink",
             "read","write","seek",
+            // Filesystem hot path during install / cp -r — these get called
+            // hundreds of times per file (transfer.lua's stat() does ~5 fs
+            // ops per entry, install_basics scans every mounted fs). Logging
+            // each call drowns out everything useful and slows the Lua
+            // thread (Log → compComp.Log → disk write through WriteThrough).
+            "exists","isDirectory","isReadOnly","list","size","spaceUsed",
+            "spaceTotal","lastModified","getLabel",
+            // GPU diagnostics — 100s/frame in MineOS GUI redraws.
+            "getResolution","maxResolution","getDepth","maxDepth",
+            "getPaletteColor","setPaletteColor","getViewport",
+            "getActiveBuffer","setActiveBuffer","getBufferSize",
+            "buffers","freeMemory","totalMemory",
         };
 
         // Called from Lua wrapper (Lua thread). args = {[1]=v1,[2]=v2,...}
         private LuaTable ComponentInvoke(string addr, string method, LuaTable args)
         {
+            // NOTE: we used to throw here when running==false to force
+            // zombie Lua threads to exit on power-off / Force Restart.
+            // That broke normal shutdown — when Lua calls
+            // `computer.shutdown()` and then OpenOS's shutdown handlers
+            // do final gpu.fill / fs.flush, those calls saw running==false
+            // and threw, which OpenOS's xpcall caught and rendered as a
+            // BIOS error on screen. The new Comp_Computer.TryPowerOn
+            // gives each boot its own ScreenBuffer, so a leaked Lua
+            // thread writes harmlessly to an orphaned buffer; the throw
+            // is no longer needed.
+
+            // Pay per-call CPU throttle BEFORE doing the work so heavy
+            // programs (IcePlayer, MineOS install, gpu.fill loops) get
+            // properly slowed down even if `debug.sethook` isn't firing.
+            ThrottleInvokeCall();
+
             if (!_quietInvoke.Contains(method))
                 lock (logLock) { Log($"[invoke] {addr.Substring(0,8)}::{method}"); }
             try
@@ -909,6 +1115,7 @@ end
                 if      (addr == gpuAddr)   result = InvokeGpu(method, a);
                 else if (addr == romAddr)   result = InvokeFsOnVfs(method, a, romVfs, readOnly: true);
                 else if (addr == hddAddr)   result = InvokeFsOnVfs(method, a, hddVfs, readOnly: false);
+                else if (addr == tmpAddr)   result = InvokeFsOnVfs(method, a, tmpVfs, readOnly: false);
                 else if (addr == scrnAddr)  result = InvokeScreen(method, a);
                 else if (addr == eepromAddr)result = InvokeEeprom(method, a);
                 else if (addr == kbdAddr)   result = InvokeKeyboard(method, a);
@@ -954,7 +1161,7 @@ end
             switch (method)
             {
                 case "address": return new object[] { compAddr };
-                case "tmpAddress": return new object[] { fsAddr };
+                case "tmpAddress": return new object[] { tmpAddr };
                 case "freeMemory": return new object[] { (double)(effectiveRamBytes - ramUsed) };
                 case "totalMemory": return new object[] { (double)effectiveRamBytes };
                 case "uptime": return new object[] { (double)uptimeSeconds };
@@ -1022,9 +1229,10 @@ end
                                 responseBytes = client.DownloadData(url);
                             }
 
-                            string responseStr = System.Text.Encoding.UTF8.GetString(responseBytes);
                             int hid = nextHandle++;
-                            _internetResponses[hid] = (responseStr, 0);
+                            // Keep raw bytes — do NOT round-trip through
+                            // UTF8.GetString or NLua will mangle binary data.
+                            _internetResponses[hid] = (responseBytes, 0);
 
                             // Build handle via Lua helper (must call from Lua thread — this IS the Lua thread)
                             var makeHandle = lua["__make_inet_handle__"] as LuaFunction;
@@ -1049,9 +1257,13 @@ end
             }
         }
 
-        // Storage for internet response streams
-        private readonly Dictionary<int, (string data, int pos)> _internetResponses =
-            new Dictionary<int, (string, int)>();
+        // Storage for internet response streams.
+        // Holds raw bytes so binary downloads (images, .pic files, anything
+        // with bytes outside the UTF-8 ASCII range) survive the Lua handoff
+        // intact. The CFunction __inet_read_raw__ reads slices via
+        // PushBuffer; no UTF-8 round-trip happens.
+        private readonly Dictionary<int, (byte[] data, int pos)> _internetResponses =
+            new Dictionary<int, (byte[], int)>();
 
         // ════════════════════════════════════════════════════════════════════
         // unicode
@@ -1181,15 +1393,25 @@ end
                 case "getResolution":
                     return new object[] { (double)screen.Width, (double)screen.Height };
                 case "maxResolution":
-                    return new object[] { (double)props.screenWidth, (double)props.screenHeight };
+                {
+                    // Real OC: GPU tier caps the resolution.
+                    //   T1 = 50×16, T2 = 80×25, T3 = 160×50.
+                    // Previously we returned props.screenWidth (=160 always),
+                    // which let MineOS request 160×50 even on a tier-1 GPU.
+                    int mw = compComp?.Hardware?.GpuWidth  ?? props.screenWidth;
+                    int mh = compComp?.Hardware?.GpuHeight ?? props.screenHeight;
+                    return new object[] { (double)mw, (double)mh };
+                }
                 case "setResolution":
                 {
                     if (args.Length >= 2)
                     {
-                        int nw = Math.Max(1, Math.Min(ToInt(args[0]), props.screenWidth));
-                        int nh = Math.Max(1, Math.Min(ToInt(args[1]), props.screenHeight));
+                        int maxW = compComp?.Hardware?.GpuWidth  ?? props.screenWidth;
+                        int maxH = compComp?.Hardware?.GpuHeight ?? props.screenHeight;
+                        int nw = Math.Max(1, Math.Min(ToInt(args[0]), maxW));
+                        int nh = Math.Max(1, Math.Min(ToInt(args[1]), maxH));
                         screen.Resize(nw, nh);
-                        Log($"[gpu] setResolution {nw}x{nh}");
+                        Log($"[gpu] setResolution {nw}x{nh} (max {maxW}x{maxH})");
                     }
                     return new object[] { true };
                 }
@@ -1308,6 +1530,79 @@ end
                     if (args.Length >= 1 && args[0] is bool blink)
                         screen.CursorVisible = blink;
                     return new object[] { true };
+
+                // ── Tier-3 GPU double-buffer API ────────────────────────────
+                // MineOS (and most non-OpenOS systems) uses these to draw
+                // off-screen and then bitblt the result. Without these MineOS
+                // calls `gpu.allocateBuffer(w,h)`, gets nil, then later does
+                // arithmetic on it and crashes with "attempt to compare
+                // number with nil" — exactly the BSOD the user reported.
+                //
+                // We implement a minimal-but-correct shape: every buffer is
+                // really the main screen, allocate just hands out a fake
+                // index, bitblt is a no-op (writes already happened on the
+                // real screen), getBufferSize reports screen size. This
+                // disables MineOS's double-buffering smoothness but lets it
+                // boot and run; we can swap in real backing buffers later.
+                case "allocateBuffer":
+                    // args: width, height (or none = use screen size)
+                    {
+                        int aw = args.Length > 0 ? ToInt(args[0]) : screen.Width;
+                        int ah = args.Length > 1 ? ToInt(args[1]) : screen.Height;
+                        int idx = ++_gpuBufferNextIdx;
+                        _gpuBufferSizes[idx] = (aw, ah);
+                        return new object[] { (double)idx };
+                    }
+                case "freeBuffer":
+                    if (args.Length > 0)
+                    {
+                        int idx = ToInt(args[0]);
+                        _gpuBufferSizes.Remove(idx);
+                        if (_gpuActiveBuffer == idx) _gpuActiveBuffer = 0;
+                    }
+                    return new object[] { true };
+                case "freeAllBuffers":
+                    _gpuBufferSizes.Clear();
+                    _gpuActiveBuffer = 0;
+                    return new object[] { true };
+                case "buffers":
+                    {
+                        var tab = NewLuaTable();
+                        int i = 1;
+                        foreach (var k in _gpuBufferSizes.Keys)
+                            tab[(double)i++] = (double)k;
+                        return new object[] { tab };
+                    }
+                case "getActiveBuffer":
+                    return new object[] { (double)_gpuActiveBuffer };
+                case "setActiveBuffer":
+                    {
+                        int prev = _gpuActiveBuffer;
+                        if (args.Length > 0) _gpuActiveBuffer = ToInt(args[0]);
+                        return new object[] { (double)prev };
+                    }
+                case "getBufferSize":
+                    {
+                        int idx = args.Length > 0 ? ToInt(args[0]) : _gpuActiveBuffer;
+                        if (idx == 0)
+                            return new object[] { (double)screen.Width, (double)screen.Height };
+                        if (_gpuBufferSizes.TryGetValue(idx, out var sz))
+                            return new object[] { (double)sz.w, (double)sz.h };
+                        return new object[] { (double)screen.Width, (double)screen.Height };
+                    }
+                case "totalMemory":
+                    // Tier-3 GPU has 16 KB of VRAM; report enough so MineOS
+                    // is happy that allocateBuffer succeeded.
+                    return new object[] { (double)(screen.Width * screen.Height * 4) };
+                case "freeMemory":
+                    return new object[] { (double)(screen.Width * screen.Height * 2) };
+                case "bitblt":
+                    // Stub: real bitblt would copy a region between buffers.
+                    // Since all our writes go to the main screen anyway,
+                    // there's nothing to copy. Return true so MineOS thinks
+                    // its frame was committed.
+                    return new object[] { true };
+
                 default:
                     return new object[] { null, "unknown gpu method: " + method };
             }
@@ -1402,13 +1697,33 @@ end
             int    Int(int i) => i < args.Length ? ToInt(args[i]) : 0;
             double Dbl(int i) => i < args.Length && args[i] != null ? Convert.ToDouble(args[i]) : 0;
 
-            // For read operations we search ROM first then HDD (merged view)
-            var merged = BuildMergedVfs();
+            // For read operations we search ROM first then HDD (merged view).
+            // tmpfs is isolated — fs.proxy(tmpAddr) sees ONLY tmpVfs, otherwise
+            // OpenOS would treat the tmpfs as the boot disk (it sees /init etc
+            // there) and install would refuse to install over it.
+            Dictionary<string, byte[]> merged;
+            if (object.ReferenceEquals(targetVfs, tmpVfs))
+                merged = tmpVfs;
+            else
+                merged = BuildMergedVfs();
 
             switch (method)
             {
-                case "isReadOnly":   return new object[] { readOnly };
-                case "spaceTotal":   return new object[] { readOnly ? (long)4096000 : props.romBytes };
+                case "isReadOnly":
+                {
+                    string fsName =
+                        object.ReferenceEquals(targetVfs, romVfs) ? "rom" :
+                        object.ReferenceEquals(targetVfs, hddVfs) ? "hdd" :
+                        object.ReferenceEquals(targetVfs, tmpVfs) ? "tmp" : "?";
+                    Log("[fs/" + fsName + "] isReadOnly=" + readOnly);
+                    return new object[] { readOnly };
+                }
+                case "spaceTotal":
+                    return new object[] {
+                        object.ReferenceEquals(targetVfs, tmpVfs) ? (long)64 * 1024
+                            : readOnly ? (long)4096000
+                            : props.romBytes
+                    };
                 case "spaceUsed":    return new object[] { targetVfs.Values.Sum(v => v.LongLength) };
                 case "exists":       return new object[] { FsExistsIn(Str(0), merged) };
                 case "isDirectory":  return new object[] { IsDirIn(Str(0), merged) };
@@ -1439,19 +1754,25 @@ end
                     return new object[] { true };
                 case "remove":
                     if (readOnly) return new object[] { null, "filesystem is read-only" };
-                    targetVfs.Remove(Norm(Str(0))); InvalidateMergedVfs();
+                    lock (targetVfs) { targetVfs.Remove(Norm(Str(0))); }
+                    InvalidateMergedVfs();
                     return new object[] { true };
                 case "rename":
                 {
                     if (readOnly) return new object[] { null, "filesystem is read-only" };
                     string nf = Norm(Str(0)), nt = Norm(Str(1));
                     if (!merged.TryGetValue(nf, out var rd)) return new object[] { null, "not found" };
-                    targetVfs[nt] = rd; targetVfs.Remove(nf); InvalidateMergedVfs();
+                    lock (targetVfs) { targetVfs[nt] = rd; targetVfs.Remove(nf); }
+                    InvalidateMergedVfs();
                     return new object[] { true };
                 }
                 case "lastModified":
                     return new object[] { DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
-                case "getLabel": return new object[] { readOnly ? "rom" : "hdd" };
+                case "getLabel":
+                    return new object[] {
+                        object.ReferenceEquals(targetVfs, tmpVfs) ? "tmpfs"
+                            : readOnly ? "rom" : "hdd"
+                    };
                 case "setLabel":
                     if (readOnly) return new object[] { null, "read-only" };
                     return new object[] { true };
@@ -1522,8 +1843,11 @@ end
             // For writes, always create/truncate in targetVfs (HDD)
             if (writing && !targetVfs.ContainsKey(npath))
             {
-                targetVfs[npath] = Array.Empty<byte>();
-                if (!appending) targetVfs[npath] = Array.Empty<byte>();
+                lock (targetVfs)
+                {
+                    targetVfs[npath] = Array.Empty<byte>();
+                    if (!appending) targetVfs[npath] = Array.Empty<byte>();
+                }
                 InvalidateMergedVfs();
             }
 
@@ -1572,8 +1896,10 @@ end
                 case "setResolution":
                     if (args.Length >= 2)
                     {
-                        int nw = Math.Max(1, Math.Min(ToInt(args[0]), props.screenWidth));
-                        int nh = Math.Max(1, Math.Min(ToInt(args[1]), props.screenHeight));
+                        int maxW = compComp?.Hardware?.GpuWidth  ?? props.screenWidth;
+                        int maxH = compComp?.Hardware?.GpuHeight ?? props.screenHeight;
+                        int nw = Math.Max(1, Math.Min(ToInt(args[0]), maxW));
+                        int nh = Math.Max(1, Math.Min(ToInt(args[1]), maxH));
                         screen.Resize(nw, nh);
                     }
                     return new object[] { true };
@@ -1651,6 +1977,150 @@ end
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // Raw byte-faithful fs.read / fs.write (KeraLua CFunctions)
+        // ════════════════════════════════════════════════════════════════════
+
+        // Registers __fs_read_raw__(handle, count) and __fs_write_raw__(handle,
+        // data) as native CFunctions. They bypass NLua's string marshaling
+        // (which is UTF-8 in both directions and corrupts non-ASCII bytes)
+        // and use lua_pushlstring / lua_tolstring directly via KeraLua's
+        // PushBuffer / ToBuffer.
+        //
+        // We accept the same arguments and return values as the legacy
+        // string-based fs.read / fs.write paths so the OpenOS io library
+        // (which calls component.fs.read(handle, count) and treats the
+        // result as a Lua string) Just Works.
+        private void RegisterRawFsIO()
+        {
+            _fsReadRawFn = new KeraLua.LuaFunction(luaStatePtr =>
+            {
+                // Pay the per-call CPU throttle just like ComponentInvoke
+                // would, so MineOS install / IcePlayer don't bypass it by
+                // taking the raw-byte fast path.
+                ThrottleInvokeCall();
+                var L = KeraLua.Lua.FromIntPtr(luaStatePtr);
+                try
+                {
+                    int handle = (int)L.ToInteger(1);
+                    long count;
+                    var typ2 = L.Type(2);
+                    if (typ2 == KeraLua.LuaType.Number)
+                    {
+                        double d = L.ToNumber(2);
+                        if (double.IsInfinity(d) || double.IsNaN(d) || d >= int.MaxValue)
+                            count = int.MaxValue;
+                        else if (d <= 0) count = 0;
+                        else count = (long)d;
+                    }
+                    else if (typ2 == KeraLua.LuaType.String)
+                    {
+                        // OpenOS occasionally passes math.huge or "*a" — be permissive.
+                        var s = L.ToString(2, false);
+                        if (string.IsNullOrEmpty(s) || s.StartsWith("*"))
+                            count = int.MaxValue;
+                        else if (!long.TryParse(s, out count)) count = int.MaxValue;
+                    }
+                    else count = int.MaxValue;
+
+                    if (!openHandles.TryGetValue(handle, out var h))
+                    {
+                        L.PushNil();
+                        L.PushString("bad handle");
+                        return 2;
+                    }
+                    var src = h.ReadVfs ?? BuildMergedVfs();
+                    if (!src.TryGetValue(h.Path, out var data) || h.Pos >= data.Length)
+                    {
+                        L.PushNil();          // EOF
+                        return 1;
+                    }
+                    int remaining = data.Length - h.Pos;
+                    int n;
+                    if (count <= 0 || count >= int.MaxValue)
+                        n = remaining;
+                    else
+                        n = (int)Math.Min(count, remaining);
+                    if (n == 0)
+                    {
+                        L.PushNil();
+                        return 1;
+                    }
+                    byte[] result = new byte[n];
+                    Buffer.BlockCopy(data, h.Pos, result, 0, n);
+                    h.Pos += n;
+                    L.PushBuffer(result);     // raw bytes — no UTF-8 conversion
+                    return 1;
+                }
+                catch (Exception ex)
+                {
+                    Log("[fs] read_raw error: " + ex.Message);
+                    L.PushNil();
+                    L.PushString(ex.Message);
+                    return 2;
+                }
+            });
+
+            _fsWriteRawFn = new KeraLua.LuaFunction(luaStatePtr =>
+            {
+                ThrottleInvokeCall();
+                var L = KeraLua.Lua.FromIntPtr(luaStatePtr);
+                try
+                {
+                    int handle = (int)L.ToInteger(1);
+                    byte[] data = L.ToBuffer(2) ?? Array.Empty<byte>();
+
+                    if (!openHandles.TryGetValue(handle, out var h))
+                    {
+                        L.PushBoolean(false);
+                        L.PushString("bad handle");
+                        return 2;
+                    }
+                    var vfsTarget = h.Vfs ?? hddVfs;
+                    // Lock around the read-modify-write so the game thread
+                    // can take a consistent snapshot for FlushHddToFolder
+                    // (it locks the same dict). Without this, install's
+                    // ~150 fs.writes race with the post-install reboot's
+                    // FlushHdd → "Collection was modified" / native crash.
+                    lock (vfsTarget)
+                    {
+                        if (!vfsTarget.TryGetValue(h.Path, out var cur))
+                            cur = Array.Empty<byte>();
+                        byte[] newData;
+                        if (h.Appending || h.Pos >= cur.Length)
+                        {
+                            newData = new byte[cur.Length + data.Length];
+                            Buffer.BlockCopy(cur, 0, newData, 0, cur.Length);
+                            Buffer.BlockCopy(data, 0, newData, cur.Length, data.Length);
+                            h.Pos = newData.Length;
+                        }
+                        else
+                        {
+                            int needed = h.Pos + data.Length;
+                            newData = new byte[Math.Max(cur.Length, needed)];
+                            Buffer.BlockCopy(cur, 0, newData, 0, cur.Length);
+                            Buffer.BlockCopy(data, 0, newData, h.Pos, data.Length);
+                            h.Pos += data.Length;
+                        }
+                        vfsTarget[h.Path] = newData;
+                    }
+                    InvalidateMergedVfs();
+                    L.PushBoolean(true);
+                    return 1;
+                }
+                catch (Exception ex)
+                {
+                    Log("[fs] write_raw error: " + ex.Message);
+                    L.PushBoolean(false);
+                    L.PushString(ex.Message);
+                    return 2;
+                }
+            });
+
+            lua.State.Register("__fs_read_raw__",  _fsReadRawFn);
+            lua.State.Register("__fs_write_raw__", _fsWriteRawFn);
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // pullSignal
         // ════════════════════════════════════════════════════════════════════
 
@@ -1658,15 +2128,26 @@ end
         {
             lua["__comp_pullSignalRaw__"] = (Func<double, LuaTable>)(timeout =>
             {
+                // Wall‑clock deadline. Previously we accumulated the *requested*
+                // chunk size (50 ms) into `elapsed` on every wakeup — if the
+                // semaphore was released early (e.g. by our old 20 Hz heartbeat
+                // in Tick()), the loop still credited a full 50 ms, so the
+                // effective sleep time was much shorter than requested. Use
+                // real elapsed time instead so sleeps match the OC spec.
                 bool infinite = double.IsInfinity(timeout) || timeout > 3600.0;
                 int totalWaitMs = infinite ? int.MaxValue : Math.Max(1, (int)(timeout * 1000));
-                int elapsed = 0;
+                long deadline = infinite
+                    ? long.MaxValue
+                    : Environment.TickCount + totalWaitMs;
                 const int chunkMs = 50;
 
                 while (running)
                 {
-                    int wait = Math.Min(chunkMs, totalWaitMs - elapsed);
-                    if (wait <= 0) break;
+                    int remaining = infinite
+                        ? chunkMs
+                        : unchecked((int)(deadline - Environment.TickCount));
+                    if (!infinite && remaining <= 0) break;
+                    int wait = Math.Min(chunkMs, remaining);
 
                     signalReady.Wait(wait);
 
@@ -1682,12 +2163,6 @@ end
                             tbl["n"] = sig.Length;
                             return tbl;
                         }
-                    }
-
-                    if (!infinite)
-                    {
-                        elapsed += wait;
-                        if (elapsed >= totalWaitMs) break;
                     }
                 }
                 return null;
@@ -1846,45 +2321,120 @@ end
         // LuaPushSignal removed — pushSignal now uses a Lua varargs wrapper
 
         // ════════════════════════════════════════════════════════════════════
-        // CPU throttle (debug.sethook)
+        // CPU throttle (debug.sethook + per-component-call throttle)
         // ════════════════════════════════════════════════════════════════════
+        //
+        // We use TWO throttle mechanisms layered together. Either alone is not
+        // enough:
+        //
+        //   1. `debug.sethook(hook, '', N)` fires `hook` every N Lua bytecodes.
+        //      Throttles pure-Lua tight loops. UNRELIABLE on some NLua/KeraLua
+        //      builds (sometimes silently doesn't fire, depending on how the
+        //      hook trampoline is registered).
+        //
+        //   2. Per-call sleep on every `component.invoke`. ALWAYS works because
+        //      every component call passes through ComponentInvoke. Charges a
+        //      small wall-clock cost per call, accumulated as "sleep debt" and
+        //      paid in 15 ms chunks (Thread.Sleep can't sleep less than the
+        //      Windows scheduler tick anyway). Naturally caps the effective
+        //      rate of gpu.fill / gpu.set / fs.read / etc.
+        //
+        // Goal:    program throughput roughly matches an OpenComputers tier-N
+        //          machine.  T1 ≈  500 / T2 ≈ 1000 / T3 ≈ 2000 component
+        //          invokes per second; pure-Lua bytecode rate ≈ hz × 1000.
 
-        // Number of Lua VM instructions between hook fires. Keep small enough
-        // that throttle reacts within a frame, large enough that the overhead
-        // of the managed→Lua crossing doesn't dominate.
         private const int CpuHookInstructions = 2000;
 
-        // Last time the hook ran (on the Lua thread). Used to measure the
-        // wall-clock window we're throttling against.
+        // Hook state (Lua thread).
         private long _lastHookTicks;
+        private int  _hookMinMs = 5;
 
-        // Minimum milliseconds to spread one hook window over. Derived from the
-        // current CpuHz — T1 = 5 Hz  → 20 ms between hooks worth of work,
-        //                  T2 = 10 Hz → 10 ms, T3 = 20 Hz → 5 ms.
-        private int _hookMinMs = 5;
+        // Diagnostic — incremented by the hook, logged by the game thread to
+        // confirm whether `debug.sethook` is actually firing in this build.
+        private int  _hookFireCount = 0;
+
+        // Per-call invoke throttle. Sleep debt accumulates on every component
+        // invoke and is paid out in chunks. Tuned per CPU tier in
+        // InstallCpuThrottleHook().
+        private double _invokeMsPerCall = 0.5;
+        private double _invokeDebtMs    = 0.0;
+        private const  int    InvokeSleepChunkMs = 15;
+        private readonly object _invokeThrottleLock = new object();
+
+        // Called at the head of every ComponentInvoke. Pays out sleep debt in
+        // ~15 ms chunks (the practical Windows Sleep granularity). Skips
+        // throttling on shutdown so Dispose can drain quickly.
+        private void ThrottleInvokeCall()
+        {
+            if (!running) return;
+            if (_invokeMsPerCall <= 0) return;
+
+            int sleepMs = 0;
+            lock (_invokeThrottleLock)
+            {
+                _invokeDebtMs += _invokeMsPerCall;
+                if (_invokeDebtMs >= InvokeSleepChunkMs)
+                {
+                    sleepMs = (int)_invokeDebtMs;
+                    if (sleepMs > 250) sleepMs = 250; // safety clamp
+                    _invokeDebtMs = 0.0;
+                }
+            }
+            if (sleepMs > 0)
+            {
+                try { Thread.Sleep(sleepMs); }
+                catch (ThreadInterruptedException) { }
+            }
+        }
 
         private void InstallCpuThrottleHook()
         {
             double hz = compComp?.Hardware?.CpuHz ?? 20.0;
             if (hz < 1.0) hz = 20.0;
 
-            // Target: one CpuHookInstructions window should take ~ 1/hz seconds
-            // scaled by (CpuHookInstructions / InstructionsPerSecondBudget).
-            // We want the *effective* instruction rate to be roughly
-            //   hz * 1000 instructions/sec  (so T3=20 000 inst/s, T2=10 000, T1=5 000).
-            //   → window_ms = CpuHookInstructions / (hz * 1000) * 1000
-            //               = CpuHookInstructions / hz
-            _hookMinMs = Math.Max(1, (int)Math.Round(CpuHookInstructions / hz));
+            // Pure-Lua throttle (count-hook). v5d: reduced target windows by
+            // 5× because the prior values were uniformly perceived as too
+            // slow during MineOS install/boot. Effective rates with the
+            // ~15 ms Windows Sleep granularity:
+            //   T1 (5 Hz)  → 80 ms window, ~ 25 000 inst/s
+            //   T2 (10 Hz) → 40 ms window, ~ 50 000 inst/s
+            //   T3 (20 Hz) → 20 ms window, ~100 000 inst/s
+            // T3's 20 ms target is below Sleep granularity so on most ticks
+            // the hook returns without sleeping at all → near-native speed.
+            // T1/T2 still get noticeable throttle. Tier 3 = "feels native",
+            // T1 = "noticeably slow", which matches the design intent.
+            _hookMinMs     = Math.Max(1, (int)Math.Round(CpuHookInstructions / hz / 5.0));
             _lastHookTicks = Environment.TickCount;
 
-            // Callable from Lua — sleeps the Lua thread to spread execution.
-            // Uses Func<bool> (rather than Action) because NLua's delegate
-            // marshalling path for void returns is more fragile across
-            // versions; a trivial return value keeps the call compatible.
-            lua["__oc_throttle_hook__"] = (Func<bool>)(() =>
+            // Per-call throttle re-enabled (v5e) at a *very* gentle rate.
+            // v5d disabled it entirely after reports of "VERY slow" with
+            // 4/hz and 10/hz; that fixed the speed but broke video timing
+            // (IcePlayer ran 2-3× too fast on T3) and made OpenOS's cursor
+            // blink irregular — both symptoms of unbounded gpu.set/gpu.fill
+            // bursts saturating the buffer between os.sleep ticks. With a
+            // *small* per-call cost we keep timing predictable without the
+            // multi-second compound delays of earlier values:
+            //   T1 (5 Hz)  → 0.10 ms/call → ~10 000 invokes/s
+            //   T2 (10 Hz) → 0.05 ms/call → ~20 000 invokes/s
+            //   T3 (20 Hz) → 0.025 ms/call → ~40 000 invokes/s
+            // Even MineOS-style GUI redraws of ~500 gpu.set/frame only
+            // accumulate ~12 ms of debt — well under the 50 ms frame
+            // budget, so it doesn't visibly throttle responsive UI work.
+            _invokeMsPerCall = 0.5 / hz;
+            _invokeDebtMs    = 0.0;
+
+            lua["__oc_throttle_hook__"] = (Action)(() =>
             {
-                if (!running) return true;
-                long now = Environment.TickCount;
+                // Diagnostics — periodically logged from the game thread.
+                System.Threading.Interlocked.Increment(ref _hookFireCount);
+
+                // On shutdown raise an error so Lua bails out of any tight
+                // loop that never yields via pullSignal. Surfaces to
+                // biosFn.Call() as a Lua error and the thread's try/catch
+                // logs it and exits cleanly.
+                if (!running) throw new Exception("[oc] shutdown requested");
+
+                long now    = Environment.TickCount;
                 int elapsed = unchecked((int)(now - _lastHookTicks));
                 int sleepMs = _hookMinMs - elapsed;
                 if (sleepMs > 0)
@@ -1893,19 +2443,26 @@ end
                     catch (ThreadInterruptedException) { }
                 }
                 _lastHookTicks = Environment.TickCount;
-                return true;
             });
 
             try
             {
-                // Install the instruction-count hook exactly once.
+                // Install the count hook via a Lua trampoline. Lua passes
+                // (event, line) to the hook function; our trampoline drops
+                // those args and calls into C# with no parameters, which
+                // sidesteps NLua's strict-arity delegate dispatch (which
+                // silently swallows hook fires on signature mismatch).
                 lua.DoString(
-                    "debug.sethook(__oc_throttle_hook__, '', " + CpuHookInstructions + ")");
-                Log($"[cpu] throttle hook installed: {hz:0.#} Hz window={_hookMinMs}ms every {CpuHookInstructions} instr");
+                    "debug.sethook(function() __oc_throttle_hook__() end, '', "
+                    + CpuHookInstructions + ")");
+                Log(
+                    $"[cpu] throttle installed: {hz:0.#} Hz  hook=every {CpuHookInstructions} inst sleep≤{_hookMinMs}ms" +
+                    $"  invoke={_invokeMsPerCall:0.##}ms/call");
             }
             catch (Exception ex)
             {
-                Log($"[cpu] failed to install throttle hook: {ex.Message}");
+                Log($"[cpu] failed to install debug.sethook: {ex.Message}");
+                Log("[cpu] falling back to per-call invoke throttle only");
             }
         }
 
@@ -1942,8 +2499,32 @@ end
             }
             catch (Exception ex)
             {
-                Log($"[boot] Compile exception: {ex.Message}");
-                screen.Println("BIOS compile error: " + ex.Message);
+                lock (logLock)
+                {
+                    Log("[boot] ====== BIOS compile exception ======");
+                    Log($"[boot] {ex.Message}");
+                    if (!string.IsNullOrEmpty(ex.StackTrace))
+                        foreach (var ln in ex.StackTrace.Split('\n'))
+                            Log("[boot] " + ln.TrimEnd('\r'));
+                    Log("[boot] ====================================");
+                }
+                screen.CurrentBG = new Color32(0, 0, 170, 255);
+                screen.CurrentFG = new Color32(255, 255, 255, 255);
+                screen.Fill(0, 0, screen.Width, screen.Height, ' ');
+                screen.Set(2, 2, "*** BIOS COMPILE EXCEPTION ***");
+                int rrow = 4, mw = Math.Max(20, screen.Width - 4);
+                foreach (var rawLine in ex.Message.Split('\n'))
+                {
+                    string line = rawLine.TrimEnd('\r');
+                    int pos = 0;
+                    while (pos < line.Length && rrow < screen.Height - 1)
+                    {
+                        int take = Math.Min(mw, line.Length - pos);
+                        screen.Set(2, rrow++, line.Substring(pos, take));
+                        pos += take;
+                    }
+                }
+                screen.CurrentBG = new Color32(0, 0, 0, 255);
                 return;
             }
 
@@ -1952,8 +2533,39 @@ end
             {
                 string err = compileResult?.Length > 1
                     ? compileResult[1]?.ToString() : "unknown";
-                Log($"[boot] BIOS compile failed: {err}");
-                screen.Println("BIOS compile failed: " + err);
+                lock (logLock)
+                {
+                    Log("[boot] ====== BIOS compile failed (syntax error in BIOS) ======");
+                    foreach (var ln in (err ?? "").Split('\n'))
+                        Log("[boot] " + ln.TrimEnd('\r'));
+                    Log($"[boot] BIOS source length: {biosCode?.Length ?? 0} bytes");
+                    Log("[boot] First 200 chars: " +
+                        (biosCode != null && biosCode.Length > 0
+                         ? biosCode.Substring(0, Math.Min(200, biosCode.Length))
+                              .Replace("\n", "\\n").Replace("\r", "")
+                         : "(empty)"));
+                    Log("[boot] =========================================================");
+                }
+                screen.CurrentBG = new Color32(0, 0, 170, 255);
+                screen.CurrentFG = new Color32(255, 255, 255, 255);
+                screen.Fill(0, 0, screen.Width, screen.Height, ' ');
+                screen.Set(2, 2, "*** BIOS SYNTAX ERROR ***");
+                int rrow = 4, mw = Math.Max(20, screen.Width - 4);
+                foreach (var rawLine in (err ?? "").Split('\n'))
+                {
+                    string line = rawLine.TrimEnd('\r');
+                    int pos = 0;
+                    while (pos < line.Length && rrow < screen.Height - 2)
+                    {
+                        int take = Math.Min(mw, line.Length - pos);
+                        screen.Set(2, rrow++, line.Substring(pos, take));
+                        pos += take;
+                    }
+                }
+                if (rrow < screen.Height - 1)
+                    screen.Set(2, screen.Height - 2,
+                        "Open Debug Console for full source dump.");
+                screen.CurrentBG = new Color32(0, 0, 0, 255);
                 return;
             }
 
@@ -1992,17 +2604,80 @@ end
                 }
                 catch (Exception ex)
                 {
-                    lock (logLock) { Log($"[boot] BIOS fatal: {ex.Message}"); }
+                    // Surface the FULL Lua/BIOS error to:
+                    //   1. The debug log (visible in "Open Debug Console"
+                    //      gizmo / Dialog_ComputerDebug). Custom BIOSes such
+                    //      as MineOS sometimes silently `pcall` errors and
+                    //      never print them, so we make sure the host log
+                    //      always has them, including the stack trace and
+                    //      any nested InnerExceptions.
+                    //   2. A blue-screen fatal on the in-game monitor with
+                    //      the message word-wrapped over several lines.
+                    string fullMsg = ex.Message ?? "(no message)";
+                    string stack   = ex.StackTrace ?? "";
+                    var inner = ex.InnerException;
+                    int innerDepth = 0;
+                    while (inner != null && innerDepth < 4)
+                    {
+                        fullMsg += "\n  caused by: " + (inner.Message ?? "(no message)");
+                        if (!string.IsNullOrEmpty(inner.StackTrace))
+                            stack += "\n--- inner trace ---\n" + inner.StackTrace;
+                        inner = inner.InnerException;
+                        innerDepth++;
+                    }
 
-                    // Blue screen of death
-                    screen.CurrentBG = new Color32(0, 0, 170, 255);
-                    screen.CurrentFG = new Color32(255, 255, 255, 255);
-                    screen.Fill(0, 0, screen.Width, screen.Height, ' ');
-                    string msg = ex.Message.Length > screen.Width - 8
-                        ? ex.Message.Substring(0, screen.Width - 8)
-                        : ex.Message;
-                    screen.Set(0, screen.Height / 2, "FATAL: " + msg);
-                    screen.CurrentBG = new Color32(0, 0, 0, 255);
+                    lock (logLock)
+                    {
+                        Log("[boot] ====== BIOS / Lua fatal error ======");
+                        foreach (var line in fullMsg.Split('\n'))
+                            Log("[boot] " + line.TrimEnd('\r'));
+                        if (!string.IsNullOrEmpty(stack))
+                        {
+                            Log("[boot] --- stack trace ---");
+                            foreach (var line in stack.Split('\n'))
+                                Log("[boot] " + line.TrimEnd('\r'));
+                        }
+                        Log("[boot] ====================================");
+                    }
+
+                    // Blue screen of death — render the error word-wrapped
+                    // over the middle rows so the user can read it without
+                    // having to open the host log.
+                    try
+                    {
+                        screen.CurrentBG = new Color32(0, 0, 170, 255);
+                        screen.CurrentFG = new Color32(255, 255, 255, 255);
+                        screen.Fill(0, 0, screen.Width, screen.Height, ' ');
+
+                        int row = Math.Max(0, screen.Height / 2 - 6);
+                        int maxw = Math.Max(20, screen.Width - 4);
+                        screen.Set(2, row++, "*** RIMCOMPUTERS BIOS FATAL ***");
+                        row++;
+
+                        // Show up to ~10 wrapped lines of the error.
+                        int linesShown = 0;
+                        foreach (var rawLine in fullMsg.Split('\n'))
+                        {
+                            string line = rawLine.TrimEnd('\r');
+                            int pos = 0;
+                            while (pos < line.Length && linesShown < 10 && row < screen.Height)
+                            {
+                                int take = Math.Min(maxw, line.Length - pos);
+                                screen.Set(2, row++, line.Substring(pos, take));
+                                pos += take;
+                                linesShown++;
+                            }
+                            if (linesShown >= 10) break;
+                        }
+
+                        if (row < screen.Height - 1)
+                        {
+                            row = screen.Height - 2;
+                            screen.Set(2, row, "See Open Debug Console for full trace.");
+                        }
+                        screen.CurrentBG = new Color32(0, 0, 0, 255);
+                    }
+                    catch { /* don't let display failure mask the original error */ }
                 }
                 finally
                 {
@@ -2032,8 +2707,11 @@ end
         {
             if (!running) return;
 
-            long gameTicks = Find.TickManager?.TicksGame ?? 0;
-            uptimeSeconds = gameTicks * (1f / 60f);
+            // uptimeSeconds is wall‑clock based now (see Stopwatch above). No
+            // need to drive it from TicksGame anymore — doing so would make
+            // computer time advance 3× faster on 3× game speed and stall when
+            // the game is paused, neither of which matches how `os.sleep`
+            // actually blocks.
             ramUsed = (openHandles.Count * 256L) + (signalQueue.Count * 128L) + 8192L;
 
             // Always drain input from the UI thread into the signal queue.
@@ -2062,25 +2740,33 @@ end
                 PlayBeep(beep.freq, beep.dur);
             }
 
-            // Throttle Lua wakeups to ~20Hz so the computer doesn't run
-            // at unbounded speed. The Lua thread sleeps in pullSignal until
-            // we release the semaphore here.
+            // NOTE: we used to release an extra semaphore slot here every ~50 ms
+            // as a "heartbeat" for pullSignal. That caused os.sleep(d) to return
+            // ~d/2 on average (wakeup could fire any time in the window, and the
+            // loop counted the full requested wait towards `elapsed`). Combined
+            // with the game‑speed‑based uptime this compounded into the 2–3×
+            // speedup reported in IcePlayer. pullSignal / os.sleep now track
+            // real wall‑clock elapsed time themselves, so no heartbeat is
+            // needed; idle pullSignal just times out its 50 ms chunk and loops.
             _luaTickAccum++;
-            if (_luaTickAccum >= LuaTickInterval)
+            if (_luaTickAccum >= LuaTickInterval) _luaTickAccum = 0;
+
+            // ── debug.sethook diagnostics ────────────────────────────────────
+            // Once every ~5 s log how many times the Lua count-hook fired.
+            // If this stays at 0 the per-call invoke throttle is the only
+            // thing limiting CPU — useful for confirming whether NLua's
+            // debug.sethook works on the user's box.
+            long nowMs = Environment.TickCount;
+            if (_lastHookLogMs == 0) _lastHookLogMs = nowMs;
+            if (nowMs - _lastHookLogMs >= 5000)
             {
-                _luaTickAccum = 0;
-                // Release one extra semaphore slot to wake pullSignal for the
-                // next "clock" tick. This simulates the OC 20Hz interrupt.
-                // Only release if nothing is already queued (avoid pileup).
-                lock (signalLock)
-                {
-                    if (signalQueue.Count == 0)
-                    {
-                        try { signalReady.Release(); } catch { }
-                    }
-                }
+                int fires = System.Threading.Interlocked.Exchange(ref _hookFireCount, 0);
+                int dt    = unchecked((int)(nowMs - _lastHookLogMs));
+                _lastHookLogMs = nowMs;
+                lock (logLock) { Log($"[cpu] hook fires={fires} in {dt}ms (bytecodes={fires * CpuHookInstructions})"); }
             }
         }
+        private long _lastHookLogMs = 0;
 
         private void PlayBeep(float frequency, float duration)
         {
@@ -2158,13 +2844,25 @@ end
             running = false;
 
             // Wake the Lua thread if it's blocked in pullSignal so it can exit.
+            // The CPU throttle hook also raises on running==false so any
+            // Lua‑side tight loop will break out within CpuHookInstructions
+            // bytecodes.
             try { signalReady.Release(100); } catch { }
 
-            // Do NOT call lua.Dispose() or luaThread.Join() on the game thread:
+            // Do NOT call lua.Dispose() / signalReady.Dispose() / luaThread.Join()
+            // on the game thread:
             //   - Join() would freeze the game.
-            //   - lua.Dispose() while Lua thread is alive → AccessViolationException.
-            // Hand off cleanup to ThreadPool. Lua thread exits on its own via
-            // ShutdownException (if available) or running==false check.
+            //   - Disposing NLua's native state while the Lua thread is still
+            //     executing triggers AccessViolation in the Lua VM. This is
+            //     almost certainly what caused the occasional crash-on-shutdown
+            //     reported by users.
+            //
+            // Hand cleanup off to the ThreadPool. Only dispose native
+            // resources AFTER the Lua thread has fully exited. If the thread
+            // is genuinely stuck (e.g. inside a PInvoke we can't interrupt),
+            // LEAK rather than risk a crash — a Lua state leak on shutdown
+            // is minor; Thread.Abort() was removed because it could return
+            // while the native Lua state was only partially unwound.
             var threadToJoin = luaThread;
             var luaToDispose = lua;
             var semToDispose = signalReady;
@@ -2172,20 +2870,26 @@ end
 
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
+                bool exited = true;
                 try
                 {
                     if (threadToJoin != null && threadToJoin.IsAlive)
-                    {
-                        bool exited = threadToJoin.Join(3000);
-                        if (!exited)
-                        {
-                            Verse.Log.Warning("[RimComputers] Lua thread did not exit in 3s — forcing abort");
-                            try { threadToJoin.Abort(); } catch { }
-                            threadToJoin.Join(2000);
-                        }
-                    }
+                        exited = threadToJoin.Join(5000);
                 }
-                catch { }
+                catch { exited = false; }
+
+                if (!exited)
+                {
+                    try
+                    {
+                        Verse.Log.Warning(
+                            "[RimComputers] Lua thread did not exit in 5s; " +
+                            "leaking Lua state to avoid a native crash");
+                    }
+                    catch { }
+                    return; // do NOT dispose — Lua thread is still using it
+                }
+
                 try { luaToDispose?.Dispose(); } catch { }
                 try { semToDispose?.Dispose(); } catch { }
             });
@@ -2231,17 +2935,37 @@ end
             if (string.IsNullOrEmpty(hddFolderPath)) return;
             try
             {
+                // Snapshot first. Without this, iterating `hddVfs` directly
+                // races with Lua-thread writes (every fs.write goes through
+                // InvokeFsOnVfs → hddVfs[path] = bytes). On reboot/shutdown
+                // the Lua thread is still alive during FlushHddToFolder
+                // (Dispose only triggers a ThreadPool worker join, not a
+                // synchronous one) — so concurrent Dictionary mutation
+                // throws "Collection was modified" or, worse, corrupts
+                // internal state and the .NET runtime crashes the
+                // process. The user's reboot-after-install crash is
+                // almost certainly this race: install just wrote ~150
+                // files, then reboot triggered FlushHdd while the Lua
+                // thread was still finishing the last few writes.
+                KeyValuePair<string, byte[]>[] snapshot;
+                lock (hddVfs)
+                {
+                    snapshot = new KeyValuePair<string, byte[]>[hddVfs.Count];
+                    int i = 0;
+                    foreach (var kv in hddVfs) snapshot[i++] = kv;
+                }
                 Directory.CreateDirectory(hddFolderPath);
-                // Write all files
-                foreach (var kv in hddVfs)
+                int count = 0;
+                foreach (var kv in snapshot)
                 {
                     if (kv.Key.EndsWith("/.dir")) continue; // skip dir markers
                     string fullPath = Path.Combine(hddFolderPath,
                         kv.Key.Replace('/', Path.DirectorySeparatorChar));
                     Directory.CreateDirectory(Path.GetDirectoryName(fullPath));
                     File.WriteAllBytes(fullPath, kv.Value);
+                    count++;
                 }
-                Log($"[hdd] Flushed {hddVfs.Count} entries to {hddFolderPath}");
+                Log($"[hdd] Flushed {count} entries to {hddFolderPath}");
             }
             catch (Exception ex) { Log($"[hdd] Flush error: {ex.Message}"); }
         }
@@ -2310,11 +3034,23 @@ end
 
         private void Log(string msg)
         {
+            // Forward to Comp_Computer.Log so the line both reaches the
+            // visible Debug Console list (compComp.debugLog === this.log,
+            // shared instance) AND hits debug.log on disk via
+            // _debugLogWriter. We DELIBERATELY do NOT add to `log`
+            // ourselves — Comp_Computer.Log already does that, and
+            // adding twice was the root cause of v5h's duplicate-line
+            // pattern ("[tick] msg" + "[tick] [oc] msg" both visible).
+            // If compComp is null (game not yet spawned, edge case),
+            // fall back to writing into the shared list directly.
+            if (compComp != null)
+            {
+                try { compComp.Log("[oc] " + msg); return; } catch { }
+            }
             lock (logLock)
             {
                 string entry = "[" + (Find.TickManager?.TicksGame ?? 0) + "] " + msg;
                 log.Add(entry);
-                // Keep last 10 000 entries — enough for long sessions, not a memory leak.
                 if (log.Count > 10000) log.RemoveAt(0);
             }
         }

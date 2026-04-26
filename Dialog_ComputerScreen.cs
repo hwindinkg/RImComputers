@@ -286,7 +286,13 @@ namespace RimComputers
         {
             EnsureCellStyle();
 
-            // Auto-resize window when GPU resolution changes
+            // Auto-resize window when GPU resolution changes.
+            //
+            // Also clamp the window's POSITION so the new rectangle stays
+            // fully on-screen; otherwise a program that calls setResolution
+            // to a larger mode (e.g. IcePlayer switching to 160×50) can push
+            // the right/bottom edge off-screen, which looks like "only part
+            // of the video is visible".
             var buf = comp.Screen;
             if (buf != null && (buf.Width != _lastScreenW || buf.Height != _lastScreenH))
             {
@@ -296,8 +302,17 @@ namespace RimComputers
                 float newH = buf.Height * BaseCellH + ToolbarH + 34f;
                 newW = Mathf.Clamp(newW, 300f, UI.screenWidth  - 40f);
                 newH = Mathf.Clamp(newH, 200f, UI.screenHeight - 60f);
-                windowRect = new Rect(windowRect.x, windowRect.y, newW, newH);
+
+                float newX = windowRect.x;
+                float newY = windowRect.y;
+                if (newX + newW > UI.screenWidth  - 20f) newX = UI.screenWidth  - 20f - newW;
+                if (newY + newH > UI.screenHeight - 40f) newY = UI.screenHeight - 40f - newH;
+                if (newX < 20f) newX = 20f;
+                if (newY < 20f) newY = 20f;
+
+                windowRect = new Rect(newX, newY, newW, newH);
                 cellStyle = null; // force font size recalculation
+                cellFont = null;  // force a fresh font at the new size
             }
 
             float y = inRect.y;
@@ -342,13 +357,57 @@ namespace RimComputers
         private int     cellFontSize = 13;
         private bool    _fontRequested = false;
 
+        // Reusable snapshot buffers (avoid per-frame GC). Resized as needed.
+        private string[]  _snapChars;
+        private Color32[] _snapFg;
+        private Color32[] _snapBg;
+        private int       _snapW, _snapH;
+
         private void DrawScreen(Rect area)
         {
             var buf = comp.Screen;
             if (buf == null) return;
 
-            float cw = area.width  / buf.Width;
-            float ch = area.height / buf.Height;
+            // ── Atomic buffer snapshot ──────────────────────────────────────
+            // The Lua thread is constantly mutating chars/fg/bg. If we read
+            // those arrays cell-by-cell during GUI.Label/DrawBoxSolid, a
+            // single rendered frame can mix cells from two different Lua
+            // frames. For IcePlayer (delta-encoded Bad Apple) this manifests
+            // as "mostly white screen with thin black outlines" — the only
+            // cells the renderer caught in the "black" half were the ones
+            // that had just been written.
+            //
+            // We grab a consistent snapshot under buf.Lock once per render,
+            // then iterate the snapshot without holding the lock while doing
+            // Unity GUI calls.
+            int W, H;
+            lock (buf.Lock)
+            {
+                W = buf.Width;
+                H = buf.Height;
+                int total = W * H;
+                if (_snapChars == null || _snapChars.Length < total)
+                {
+                    _snapChars = new string[total];
+                    _snapFg    = new Color32[total];
+                    _snapBg    = new Color32[total];
+                }
+                _snapW = W;
+                _snapH = H;
+                for (int row = 0; row < H; row++)
+                {
+                    for (int col = 0; col < W; col++)
+                    {
+                        int idx = row * W + col;
+                        _snapChars[idx] = buf.GetChar(col, row);
+                        _snapFg[idx]    = buf.GetFG(col, row);
+                        _snapBg[idx]    = buf.GetBG(col, row);
+                    }
+                }
+            }
+
+            float cw = area.width  / W;
+            float ch = area.height / H;
 
             EnsureCellStyle();
 
@@ -356,51 +415,69 @@ namespace RimComputers
             // Unity dynamic fonts populate glyphs asynchronously. We must call
             // RequestCharactersInTexture BEFORE GUI.Label, otherwise Unicode chars
             // (box-drawing ╔ ║ ═, arrows ← ↑ →, Cyrillic, etc.) show as ?.
-            // We request on EVERY Layout event so newly-appeared chars are covered.
-            if (cellFont != null && Event.current.type == EventType.Layout)
+            if (cellFont != null)
             {
-                var sb = new System.Text.StringBuilder(buf.Width * buf.Height);
-                for (int row = 0; row < buf.Height; row++)
-                    for (int col = 0; col < buf.Width; col++)
-                    {
-                        string c = buf.GetChar(col, row);
-                        if (!string.IsNullOrEmpty(c) && c != " ") sb.Append(c);
-                    }
-                if (sb.Length > 0)
-                    cellFont.RequestCharactersInTexture(sb.ToString(), cellFontSize, FontStyle.Normal);
-
-                // Also request on first frame to pre-warm the font atlas
                 if (!_fontRequested)
                 {
                     _fontRequested = true;
-                    cellFont.RequestCharactersInTexture(BoxDrawingPreload, cellFontSize, FontStyle.Normal);
+                    try
+                    {
+                        cellFont.RequestCharactersInTexture(
+                            BoxDrawingPreload, cellFontSize, FontStyle.Normal);
+                    }
+                    catch { }
                 }
 
-                // Rebuild style to pick up any atlas changes
+                var sb = new System.Text.StringBuilder(W * H);
+                int cells = W * H;
+                for (int i = 0; i < cells; i++)
+                {
+                    string c = _snapChars[i];
+                    if (!string.IsNullOrEmpty(c) && c != " ") sb.Append(c);
+                }
+                if (sb.Length > 0)
+                {
+                    try
+                    {
+                        cellFont.RequestCharactersInTexture(
+                            sb.ToString(), cellFontSize, FontStyle.Normal);
+                    }
+                    catch { }
+                }
+
                 if (cellStyle != null) cellStyle.font = cellFont;
             }
 
-            // ── Render cells ──────────────────────────────────────────────────
+            // ── Render cells from snapshot ────────────────────────────────────
+            //
+            // We ALWAYS draw the BG box for every cell, even when it's a space
+            // on a black background. The previous "isEmpty" optimisation skipped
+            // those cells, relying on the outer black rect underneath — but the
+            // outer rect plus fractional cell sizes (cw = area.w / 160) meant
+            // thin sub-pixel slivers of the black underlay bled through between
+            // adjacent non-black cells, which showed up as the "black outlines
+            // around characters" artefact in IcePlayer video playback.
+            //
+            // Overlap each cell by +1 px in both axes so adjacent cells meet
+            // without any gap regardless of the fractional cell size.
             Text.Font   = GameFont.Tiny;
             Text.Anchor = TextAnchor.UpperLeft;
 
-            for (int row = 0; row < buf.Height; row++)
+            for (int row = 0; row < H; row++)
             {
-                for (int col = 0; col < buf.Width; col++)
+                for (int col = 0; col < W; col++)
                 {
-                    Color32 bgColor = buf.GetBG(col, row);
-                    Color32 fgColor = buf.GetFG(col, row);
-                    string  cell    = buf.GetChar(col, row);
+                    int idx = row * W + col;
+                    Color32 bgColor = _snapBg[idx];
+                    Color32 fgColor = _snapFg[idx];
+                    string  cell    = _snapChars[idx];
 
                     float px = area.x + col * cw;
                     float py = area.y + row * ch;
 
-                    bool isEmpty = (cell == " " || cell == "\0" || string.IsNullOrEmpty(cell))
-                                   && bgColor.r == 0 && bgColor.g == 0 && bgColor.b == 0;
-
-                    if (!isEmpty)
-                        Widgets.DrawBoxSolid(new Rect(px, py, cw + 0.5f, ch + 0.5f),
-                            new Color(bgColor.r / 255f, bgColor.g / 255f, bgColor.b / 255f));
+                    Widgets.DrawBoxSolid(
+                        new Rect(px, py, cw + 1f, ch + 1f),
+                        new Color(bgColor.r / 255f, bgColor.g / 255f, bgColor.b / 255f));
 
                     if (string.IsNullOrEmpty(cell) || cell == " ") continue;
 
@@ -440,53 +517,157 @@ namespace RimComputers
         {
             if (cellStyle != null && cellFont != null) return;
 
+            // Pick a font size that fits in BOTH dimensions so glyphs don't
+            // overflow into adjacent cells. Earlier we sized purely by
+            // height (`* 0.85`) which produced glyphs ~10 px wide in 8 px
+            // cells at 160-column resolution — IcePlayer/MineOS users
+            // reported "only ~60 columns visible" because adjacent letters
+            // were drawing over each other.
+            int sw = comp.Screen?.Width  ?? 80;
+            int sh = comp.Screen?.Height ?? 25;
+            float cellW = (windowRect.width  - 30f)              / Mathf.Max(1, sw);
+            float cellH = (windowRect.height - ToolbarH - 34f)   / Mathf.Max(1, sh);
+            // For a typical monospace font glyph_w ≈ 0.55 × fontSize
+            // and line height ≈ 1.2 × fontSize. Cap fontSize so neither
+            // dimension overflows the cell.
+            float byWidth  = cellW / 0.55f;
+            float byHeight = cellH * 0.83f;
             cellFontSize = Mathf.RoundToInt(
-                Mathf.Clamp(windowRect.height / (comp.Screen?.Height ?? 50) * 0.85f, 8f, 20f));
+                Mathf.Clamp(Mathf.Min(byWidth, byHeight), 8f, 20f));
 
-            // Build a single font with a fallback chain so characters missing
-            // from the primary face (e.g. Cyrillic, box-drawing, arrows) are
-            // rendered from the next-best OS font instead of showing as "?".
+            // Unicode/Cyrillic problem:
             //
-            // Unity's `Font.CreateDynamicFontFromOSFont(string[] names, int)`
-            // constructs a font backed by all named OS fonts — the first one
-            // is primary, the rest are fallbacks. This is essential on
-            // Windows where Consolas lacks some glyphs that "Segoe UI Symbol"
-            // / "Lucida Sans Unicode" / "Arial Unicode MS" cover.
+            //   `Font.CreateDynamicFontFromOSFont(string[] names, int)` in
+            //   Unity does NOT build a glyph-by-glyph fallback chain — it
+            //   just picks the first installed name from the list. If that
+            //   font happens to miss a codepoint we'll still render '?'.
+            //
+            //   Instead we build a chain by hand:
+            //     - Create a primary Font from a broad-coverage OS font.
+            //     - Attach a list of fallback Fonts via Font.fallbackFonts
+            //       so Unity's dynamic font atlas falls through to them
+            //       when the primary doesn't contain a glyph (this IS the
+            //       official supported mechanism, available since
+            //       Unity 5.4).
+            //
+            //   We deliberately pick broad-Unicode fonts (not "Consolas"
+            //   first). Consolas lacks many Unicode blocks, and because
+            //   Unity's multi-name overload prefers the *first* installed
+            //   match, putting Consolas first was causing the exact bug
+            //   reported.
             if (cellFont == null)
             {
-                string[] fontCandidates =
+                // Order: broad Unicode monospace → broad Unicode proportional
+                // → anything else that's likely to cover missing codepoints.
+                string[] primaryCandidates =
                 {
-                    // Monospace primaries
-                    "Consolas", "Cascadia Mono", "Courier New", "Lucida Console",
-                    "DejaVu Sans Mono", "Liberation Mono", "Menlo", "Monaco",
-                    // Broad Unicode / box-drawing fallbacks
-                    "Segoe UI Symbol", "Segoe UI", "Lucida Sans Unicode",
-                    "Arial Unicode MS", "Noto Sans Mono", "Noto Sans",
-                    "DejaVu Sans", "Arial",
+                    // Known-good broad Unicode monospace
+                    "DejaVu Sans Mono", "Noto Sans Mono", "Cascadia Mono",
+                    "Consolas", "Courier New", "Lucida Console",
+                    "Liberation Mono", "Menlo", "Monaco",
+                    // Broad Unicode proportional (not monospace, but ensures
+                    // *something* renders)
+                    "Segoe UI", "Arial Unicode MS", "Lucida Sans Unicode",
+                    "Noto Sans", "DejaVu Sans", "Arial", "Tahoma",
                 };
 
-                try
+                foreach (var name in primaryCandidates)
                 {
-                    // Primary + fallbacks in one font object (Unity picks
-                    // glyphs from the first font that has them).
-                    cellFont = Font.CreateDynamicFontFromOSFont(
-                        fontCandidates, cellFontSize);
+                    try
+                    {
+                        var f = Font.CreateDynamicFontFromOSFont(name, cellFontSize);
+                        if (f != null) { cellFont = f; break; }
+                    }
+                    catch { }
                 }
-                catch { cellFont = null; }
 
-                // Fallback: try them one by one if the multi-font overload
-                // isn't available or returned null.
+                // Very last resort: whatever Unity's dynamic default is.
                 if (cellFont == null)
                 {
-                    foreach (string fname in fontCandidates)
+                    try
                     {
+                        cellFont = Font.CreateDynamicFontFromOSFont(
+                            primaryCandidates, cellFontSize);
+                    }
+                    catch { }
+                }
+
+                // Build an explicit fallback chain. Any codepoint the primary
+                // can't render triggers a lookup through these in order.
+                if (cellFont != null)
+                {
+                    var fallbacks = new List<Font>();
+                    // IMPORTANT: prefer MONOSPACE fallbacks. Earlier we listed
+                    // Segoe UI / Tahoma / Arial first, but those are
+                    // proportional — when a glyph fell through to them, its
+                    // advance width didn't match the cell width and adjacent
+                    // letters drifted out of column alignment (visible in the
+                    // BSOD screenshot as "M i n e CS" instead of "MineCS").
+                    // Cascadia/Consolas/DejaVu Sans Mono cover Cyrillic and
+                    // box-drawing on most modern Windows installs; fall back
+                    // to symbol-only proportional fonts only if all monospace
+                    // candidates miss a codepoint.
+                    string[] fallbackNames =
+                    {
+                        // Monospace, broad Unicode coverage (Cyrillic + boxes)
+                        "Cascadia Mono", "Cascadia Code",
+                        "Consolas", "Lucida Console",
+                        "Courier New", "Liberation Mono",
+                        "DejaVu Sans Mono", "Noto Sans Mono",
+                        "Source Code Pro",
+                        // Proportional last-resort (better wrong-width glyph
+                        // than a "?" tofu)
+                        "Segoe UI Symbol", "Arial Unicode MS",
+                        "Lucida Sans Unicode", "Segoe UI",
+                        "Tahoma", "Arial",
+                    };
+                    foreach (var name in fallbackNames)
+                    {
+                        // Don't double-add the primary
+                        if (cellFont.name != null &&
+                            cellFont.name.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0)
+                            continue;
                         try
                         {
-                            var f = Font.CreateDynamicFontFromOSFont(fname, cellFontSize);
-                            if (f != null) { cellFont = f; break; }
+                            var fb = Font.CreateDynamicFontFromOSFont(name, cellFontSize);
+                            if (fb != null) fallbacks.Add(fb);
                         }
                         catch { }
                     }
+                    // Font.fallbackFonts is missing on the UnityEngine.dll
+                    // shipped with this RimWorld build (CS1061 at compile
+                    // time on some configurations), so set it via reflection.
+                    // No-op if the property genuinely isn't there at runtime.
+                    bool fallbackApplied = false;
+                    try
+                    {
+                        var prop = typeof(Font).GetProperty(
+                            "fallbackFonts",
+                            System.Reflection.BindingFlags.Public |
+                            System.Reflection.BindingFlags.Instance);
+                        if (prop != null)
+                        {
+                            prop.SetValue(cellFont, fallbacks.ToArray(), null);
+                            fallbackApplied = true;
+                        }
+                    }
+                    catch { }
+
+                    // One-time diagnostic: lets the user see in the host log
+                    // which primary font Unity actually picked and how many
+                    // fallbacks were attached. This is the "did monospace
+                    // Cyrillic happen?" answer.
+                    try
+                    {
+                        var fbNames = new List<string>();
+                        foreach (var f in fallbacks)
+                            if (f != null) fbNames.Add(f.name ?? "(unnamed)");
+                        Verse.Log.Message(
+                            $"[RimComputers] cell font primary='{cellFont.name}' " +
+                            $"fontSize={cellFontSize} fallback({(fallbackApplied ? "ok" : "MISSING")})=" +
+                            (fbNames.Count > 0 ? string.Join(", ", fbNames) : "<none>"));
+                    }
+                    catch { }
                 }
             }
 

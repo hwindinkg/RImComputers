@@ -108,6 +108,75 @@ namespace RimComputers
         public float EffectiveRamMB    => EffectiveRamBytes / 1048576f;
         public string RamLabel         => $"RAM T{Hardware.ramTier} ({EffectiveRamMB:0.#}MB)";
 
+        // ── Persistent debug log file ────────────────────────────────────────
+        // The user asked us to keep a copy of the in-memory debug log on
+        // disk, so that when the game itself crashes (and the in-memory
+        // List<string> is lost), they can still attach the log to a bug
+        // report. We truncate the file once per session (in
+        // PostSpawnSetup) and again whenever the user clicks "Clear log"
+        // in Debug Console; every Log() call appends + flushes a line
+        // immediately so partial logs survive crashes.
+        public string DebugLogPath =>
+            Path.Combine(DebugFolderPath, "debug.log");
+        public string DebugFolderPath =>
+            Path.Combine(
+                GenFilePaths.SaveDataFolderPath,
+                "RimComputers",
+                parent.ThingID ?? "unknown");
+        private System.IO.StreamWriter _debugLogWriter;
+        private readonly object _debugLogIoLock = new object();
+        private bool _debugLogTruncatedThisSession = false;
+
+        private void EnsureDebugLogWriter()
+        {
+            if (_debugLogWriter != null) return;
+            try
+            {
+                Directory.CreateDirectory(DebugFolderPath);
+                bool append = _debugLogTruncatedThisSession;
+                // FileOptions.WriteThrough bypasses the OS write cache, so each
+                // line hits the disk synchronously. Without this, a hard game
+                // crash loses the last ~30-100 lines of the log (which are the
+                // most important ones for diagnosing the crash). The previous
+                // version had AutoFlush=true on the StreamWriter, but that only
+                // flushes the StreamWriter buffer to the FileStream — it does
+                // NOT flush the FileStream's OS buffer.
+                _debugLogWriter = new System.IO.StreamWriter(
+                    new System.IO.FileStream(
+                        DebugLogPath,
+                        append ? System.IO.FileMode.Append : System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.ReadWrite,
+                        bufferSize: 4096,
+                        options: System.IO.FileOptions.WriteThrough),
+                    new System.Text.UTF8Encoding(false));
+                _debugLogWriter.AutoFlush = true;
+                _debugLogTruncatedThisSession = true;
+                if (!append)
+                {
+                    _debugLogWriter.WriteLine($"# RimComputers debug log — opened {System.DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                    _debugLogWriter.WriteLine($"# computer ThingID={parent.ThingID}, save={GenFilePaths.SaveDataFolderPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Verse.Log.WarningOnce("[RimComputers] failed to open debug log: " + ex.Message,
+                                      DebugLogPath.GetHashCode());
+                _debugLogWriter = null;
+            }
+        }
+
+        public void ClearPersistedDebugLog()
+        {
+            lock (_debugLogIoLock)
+            {
+                try { _debugLogWriter?.Dispose(); } catch { }
+                _debugLogWriter = null;
+                _debugLogTruncatedThisSession = false; // next open truncates
+                EnsureDebugLogWriter();
+            }
+        }
+
         // ── HDD folder on real disk ──────────────────────────────────────────
         public string HddFolderPath =>
             Path.Combine(
@@ -125,7 +194,21 @@ namespace RimComputers
             base.PostSpawnSetup(respawningAfterLoad);
             screen = new ScreenBuffer(Hardware.GpuWidth, Hardware.GpuHeight);
             Directory.CreateDirectory(HddFolderPath);
+            // Reset the on-disk log on every game-session entry so it
+            // doesn't grow forever and the user always sees a fresh log
+            // when they attach it to a bug report.
+            _debugLogTruncatedThisSession = false;
+            try { _debugLogWriter?.Dispose(); } catch { }
+            _debugLogWriter = null;
+            EnsureDebugLogWriter();
             if (state == ComputerState.Running) InitLua();
+        }
+
+        public override void PostDestroy(DestroyMode mode, Map previousMap)
+        {
+            try { _debugLogWriter?.Dispose(); } catch { }
+            _debugLogWriter = null;
+            base.PostDestroy(mode, previousMap);
         }
 
         public override void CompTick()
@@ -146,7 +229,16 @@ namespace RimComputers
                 FlushHdd(); ForceOff("Lua reboot");
                 state = ComputerState.Booting;
                 bootTicksLeft = BootTicks;
-                screen.Clear(); screen.Println("Rebooting..."); return;
+                // Allocate a fresh ScreenBuffer for the new boot so that any
+                // orphan Lua thread from the prior session that didn't exit
+                // within ShutdownLua's join window can't keep painting over
+                // the new BIOS splash. (Same trick as TryPowerOn.) Previously
+                // the reboot path reused the existing buffer, which the
+                // orphan thread held a reference to and kept writing to —
+                // this raced with the new boot's screen.Clear()/Println()
+                // and was the most likely source of the reboot-time crash.
+                screen = new ScreenBuffer(Hardware.GpuWidth, Hardware.GpuHeight);
+                screen.Println("Rebooting..."); return;
             }
 
             if (state == ComputerState.Booting)
@@ -190,7 +282,16 @@ namespace RimComputers
             if (!HasPower) { Log("No power"); return; }
             state = ComputerState.Booting;
             bootTicksLeft = BootTicks;
-            screen.Clear();
+
+            // Allocate a *new* ScreenBuffer for this boot. The previous Lua
+            // thread (from the prior power-on) might still be alive in the
+            // background — it can't be Join()ed safely on the game thread —
+            // and if we reuse the same buffer instance it will keep painting
+            // its leftover frames over our new BIOS splash. By giving each
+            // boot its own buffer the orphan thread writes harmlessly into
+            // memory nobody is reading. Comp_Computer.Screen returns the
+            // current `screen` field so the UI auto-follows.
+            screen = new ScreenBuffer(Hardware.GpuWidth, Hardware.GpuHeight);
             screen.Println("RimComputers BIOS");
             screen.Println($"CPU: T{Hardware.cpuTier}  RAM: {EffectiveRamMB:0.#}MB  GPU: T{Hardware.gpuTier}");
             screen.Println("Booting...");
@@ -283,10 +384,21 @@ namespace RimComputers
 
         public void Log(string msg)
         {
+            string entry = $"[{Find.TickManager?.TicksGame ?? 0}] {msg}";
             lock (debugLog)
             {
-                debugLog.Add($"[{Find.TickManager?.TicksGame ?? 0}] {msg}");
+                debugLog.Add(entry);
                 if (debugLog.Count > 10000) debugLog.RemoveAt(0);
+            }
+            // Mirror to disk so crashes don't lose the log.
+            lock (_debugLogIoLock)
+            {
+                try
+                {
+                    EnsureDebugLogWriter();
+                    _debugLogWriter?.WriteLine(entry);
+                }
+                catch { /* ignore — disk-log is best-effort */ }
             }
         }
 

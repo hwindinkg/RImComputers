@@ -158,11 +158,27 @@ namespace RimComputers
             if (Widgets.ButtonText(new Rect(bx, y, 90f, 24f), "Clear Log"))
             {
                 lock (comp.DebugLog) comp.DebugLog.Clear();
+                comp.ClearPersistedDebugLog(); // also truncates the on-disk log
                 replOutput   = "";
                 lastLogCount = 0;
                 logScroll    = Vector2.zero;
             }
             bx += 96f;
+
+            if (Widgets.ButtonText(new Rect(bx, y, 130f, 24f), "Open Log Folder"))
+            {
+                try
+                {
+                    System.IO.Directory.CreateDirectory(comp.DebugFolderPath);
+                    System.Diagnostics.Process.Start(comp.DebugFolderPath);
+                }
+                catch (System.Exception ex)
+                {
+                    Messages.Message("Open log folder: " + ex.Message,
+                                     MessageTypeDefOf.RejectInput, false);
+                }
+            }
+            bx += 136f;
 
             if (Widgets.ButtonText(new Rect(bx, y, 120f, 24f), "Force Restart"))
             {
@@ -179,6 +195,46 @@ namespace RimComputers
                 Messages.Message("Log copied to clipboard.", MessageTypeDefOf.SilentInput, false);
             }
             bx += 116f;
+
+            // Dumps the current monitor contents (line by line) into the log.
+            // Lets us capture e.g. a MineOS-internal xpcall error traceback
+            // that's painted on the screen but never thrown out to C#.
+            if (Widgets.ButtonText(new Rect(bx, y, 130f, 24f), "Dump Screen"))
+            {
+                var buf = comp.Screen;
+                if (buf != null)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    int W = buf.Width, H = buf.Height;
+                    object lk = null;
+                    try { lk = buf.Lock; } catch { }
+                    if (lk != null)
+                    {
+                        lock (lk)
+                        {
+                            for (int row = 0; row < H; row++)
+                            {
+                                sb.Length = 0;
+                                for (int col = 0; col < W; col++)
+                                    sb.Append(buf.GetChar(col, row) ?? " ");
+                                comp.Log("[screen] " + sb.ToString().TrimEnd());
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int row = 0; row < H; row++)
+                        {
+                            sb.Length = 0;
+                            for (int col = 0; col < W; col++)
+                                sb.Append(buf.GetChar(col, row) ?? " ");
+                            comp.Log("[screen] " + sb.ToString().TrimEnd());
+                        }
+                    }
+                    comp.Log($"[screen] === end dump ({W}x{H}) ===");
+                }
+            }
+            bx += 136f;
 
             // Toggle auto-scroll
             bool newAuto = autoScroll;

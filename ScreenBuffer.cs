@@ -18,6 +18,22 @@ namespace RimComputers
         private Color32[,] fg;
         private Color32[,] bg;
 
+        // ── Render lock ──────────────────────────────────────────────────
+        // The Lua thread mutates the buffer concurrently with the game
+        // thread reading it from OnGUI. Without synchronisation a renderer
+        // pass could capture cells from two different Lua frames mid-write
+        // — this is what produced the IcePlayer "thin black outlines on a
+        // mostly-white screen" artefact: Bad Apple's encoder uses delta
+        // updates (set bg=white, fill old silhouette area; set bg=black,
+        // fill new silhouette area), and our renderer was sampling between
+        // the two halves so only the new edge cells ever appeared black.
+        //
+        // All mutating ops below take this lock; the renderer wraps its
+        // read loop in `lock (buf.Lock) { ... }` to atomically capture one
+        // consistent state.
+        private readonly object _lock = new object();
+        public object Lock => _lock;
+
         // Current drawing colors
         public Color32 CurrentFG { get; set; } = new Color32(255, 255, 255, 255);
         public Color32 CurrentBG { get; set; } = new Color32(0, 0, 0, 255);
@@ -59,38 +75,41 @@ namespace RimComputers
 
         public void Resize(int newWidth, int newHeight)
         {
-            if (newWidth == Width && newHeight == Height) return;
+            lock (_lock)
+            {
+                if (newWidth == Width && newHeight == Height) return;
 
-            var newChars = new string[newWidth, newHeight];
-            var newFg    = new Color32[newWidth, newHeight];
-            var newBg    = new Color32[newWidth, newHeight];
+                var newChars = new string[newWidth, newHeight];
+                var newFg    = new Color32[newWidth, newHeight];
+                var newBg    = new Color32[newWidth, newHeight];
 
-            for (int cy = 0; cy < newHeight; cy++)
-                for (int cx = 0; cx < newWidth; cx++)
-                {
-                    newChars[cx, cy] = " ";
-                    newFg[cx, cy]    = Palette[15];
-                    newBg[cx, cy]    = Palette[0];
-                }
+                for (int cy = 0; cy < newHeight; cy++)
+                    for (int cx = 0; cx < newWidth; cx++)
+                    {
+                        newChars[cx, cy] = " ";
+                        newFg[cx, cy]    = Palette[15];
+                        newBg[cx, cy]    = Palette[0];
+                    }
 
-            int copyW = Math.Min(Width, newWidth);
-            int copyH = Math.Min(Height, newHeight);
-            for (int cy = 0; cy < copyH; cy++)
-                for (int cx = 0; cx < copyW; cx++)
-                {
-                    newChars[cx, cy] = chars[cx, cy];
-                    newFg[cx, cy]    = fg[cx, cy];
-                    newBg[cx, cy]    = bg[cx, cy];
-                }
+                int copyW = Math.Min(Width, newWidth);
+                int copyH = Math.Min(Height, newHeight);
+                for (int cy = 0; cy < copyH; cy++)
+                    for (int cx = 0; cx < copyW; cx++)
+                    {
+                        newChars[cx, cy] = chars[cx, cy];
+                        newFg[cx, cy]    = fg[cx, cy];
+                        newBg[cx, cy]    = bg[cx, cy];
+                    }
 
-            Width  = newWidth;
-            Height = newHeight;
-            chars  = newChars;
-            fg     = newFg;
-            bg     = newBg;
+                Width  = newWidth;
+                Height = newHeight;
+                chars  = newChars;
+                fg     = newFg;
+                bg     = newBg;
 
-            CursorX = Math.Min(CursorX, Width  - 1);
-            CursorY = Math.Min(CursorY, Height - 1);
+                CursorX = Math.Min(CursorX, Width  - 1);
+                CursorY = Math.Min(CursorY, Height - 1);
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -100,89 +119,101 @@ namespace RimComputers
         /// <summary>gpu.set(x, y, text) — iterates Unicode code points.</summary>
         public void Set(int x, int y, string text, bool vertical = false)
         {
-            int col = 0;
-            int pos = 0;
-            while (pos < text.Length)
+            lock (_lock)
             {
-                string cell;
-                if (char.IsHighSurrogate(text[pos]) && pos + 1 < text.Length && char.IsLowSurrogate(text[pos + 1]))
+                int col = 0;
+                int pos = 0;
+                while (pos < text.Length)
                 {
-                    cell = text.Substring(pos, 2);
-                    pos += 2;
-                }
-                else
-                {
-                    cell = text[pos].ToString();
-                    pos++;
-                }
+                    string cell;
+                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < text.Length && char.IsLowSurrogate(text[pos + 1]))
+                    {
+                        cell = text.Substring(pos, 2);
+                        pos += 2;
+                    }
+                    else
+                    {
+                        cell = text[pos].ToString();
+                        pos++;
+                    }
 
-                int cx = vertical ? x       : x + col;
-                int cy = vertical ? y + col : y;
-                if (cx >= 0 && cx < Width && cy >= 0 && cy < Height)
-                {
-                    chars[cx, cy] = cell;
-                    fg[cx, cy]    = CurrentFG;
-                    bg[cx, cy]    = CurrentBG;
+                    int cx = vertical ? x       : x + col;
+                    int cy = vertical ? y + col : y;
+                    if (cx >= 0 && cx < Width && cy >= 0 && cy < Height)
+                    {
+                        chars[cx, cy] = cell;
+                        fg[cx, cy]    = CurrentFG;
+                        bg[cx, cy]    = CurrentBG;
+                    }
+                    col++;
                 }
-                col++;
             }
         }
 
         /// <summary>gpu.fill(x, y, w, h, char)</summary>
         public void Fill(int x, int y, int w, int h, char c)
         {
-            string cs = c.ToString();
-            for (int cy = y; cy < y + h && cy < Height; cy++)
-                for (int cx = x; cx < x + w && cx < Width; cx++)
-                {
-                    chars[cx, cy] = cs;
-                    fg[cx, cy]    = CurrentFG;
-                    bg[cx, cy]    = CurrentBG;
-                }
+            lock (_lock)
+            {
+                string cs = c.ToString();
+                for (int cy = y; cy < y + h && cy < Height; cy++)
+                    for (int cx = x; cx < x + w && cx < Width; cx++)
+                    {
+                        chars[cx, cy] = cs;
+                        fg[cx, cy]    = CurrentFG;
+                        bg[cx, cy]    = CurrentBG;
+                    }
+            }
         }
 
         /// <summary>Fill with a Unicode string (for surrogate-pair characters).</summary>
         public void FillStr(int x, int y, int w, int h, string s)
         {
-            for (int cy = y; cy < y + h && cy < Height; cy++)
-                for (int cx = x; cx < x + w && cx < Width; cx++)
-                {
-                    chars[cx, cy] = s;
-                    fg[cx, cy]    = CurrentFG;
-                    bg[cx, cy]    = CurrentBG;
-                }
+            lock (_lock)
+            {
+                for (int cy = y; cy < y + h && cy < Height; cy++)
+                    for (int cx = x; cx < x + w && cx < Width; cx++)
+                    {
+                        chars[cx, cy] = s;
+                        fg[cx, cy]    = CurrentFG;
+                        bg[cx, cy]    = CurrentBG;
+                    }
+            }
         }
 
         /// <summary>gpu.copy(x, y, w, h, tx, ty)</summary>
         public void Copy(int x, int y, int w, int h, int tx, int ty)
         {
-            var tc = new string[w, h];
-            var tf = new Color32[w, h];
-            var tb = new Color32[w, h];
+            lock (_lock)
+            {
+                var tc = new string[w, h];
+                var tf = new Color32[w, h];
+                var tb = new Color32[w, h];
 
-            for (int dy = 0; dy < h; dy++)
-                for (int dx = 0; dx < w; dx++)
-                {
-                    int sx = x + dx, sy = y + dy;
-                    if (sx >= 0 && sx < Width && sy >= 0 && sy < Height)
+                for (int dy = 0; dy < h; dy++)
+                    for (int dx = 0; dx < w; dx++)
                     {
-                        tc[dx, dy] = chars[sx, sy];
-                        tf[dx, dy] = fg[sx, sy];
-                        tb[dx, dy] = bg[sx, sy];
+                        int sx = x + dx, sy = y + dy;
+                        if (sx >= 0 && sx < Width && sy >= 0 && sy < Height)
+                        {
+                            tc[dx, dy] = chars[sx, sy];
+                            tf[dx, dy] = fg[sx, sy];
+                            tb[dx, dy] = bg[sx, sy];
+                        }
                     }
-                }
 
-            for (int dy = 0; dy < h; dy++)
-                for (int dx = 0; dx < w; dx++)
-                {
-                    int dx2 = x + tx + dx, dy2 = y + ty + dy;
-                    if (dx2 >= 0 && dx2 < Width && dy2 >= 0 && dy2 < Height)
+                for (int dy = 0; dy < h; dy++)
+                    for (int dx = 0; dx < w; dx++)
                     {
-                        chars[dx2, dy2] = tc[dx, dy];
-                        fg[dx2, dy2]    = tf[dx, dy];
-                        bg[dx2, dy2]    = tb[dx, dy];
+                        int dx2 = x + tx + dx, dy2 = y + ty + dy;
+                        if (dx2 >= 0 && dx2 < Width && dy2 >= 0 && dy2 < Height)
+                        {
+                            chars[dx2, dy2] = tc[dx, dy];
+                            fg[dx2, dy2]    = tf[dx, dy];
+                            bg[dx2, dy2]    = tb[dx, dy];
+                        }
                     }
-                }
+            }
         }
 
         /// <summary>gpu.get(x, y)</summary>
@@ -196,15 +227,18 @@ namespace RimComputers
         /// <summary>Clear the whole screen.</summary>
         public void Clear()
         {
-            for (int cy = 0; cy < Height; cy++)
-                for (int cx = 0; cx < Width; cx++)
-                {
-                    chars[cx, cy] = " ";
-                    fg[cx, cy]    = Palette[15];
-                    bg[cx, cy]    = Palette[0];
-                }
-            CursorX = 0;
-            CursorY = 0;
+            lock (_lock)
+            {
+                for (int cy = 0; cy < Height; cy++)
+                    for (int cx = 0; cx < Width; cx++)
+                    {
+                        chars[cx, cy] = " ";
+                        fg[cx, cy]    = Palette[15];
+                        bg[cx, cy]    = Palette[0];
+                    }
+                CursorX = 0;
+                CursorY = 0;
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -223,20 +257,23 @@ namespace RimComputers
 
         public void ScrollUp(int lines)
         {
-            for (int cy = 0; cy < Height - lines; cy++)
-                for (int cx = 0; cx < Width; cx++)
-                {
-                    chars[cx, cy] = chars[cx, cy + lines];
-                    fg[cx, cy]    = fg[cx, cy + lines];
-                    bg[cx, cy]    = bg[cx, cy + lines];
-                }
-            for (int cy = Height - lines; cy < Height; cy++)
-                for (int cx = 0; cx < Width; cx++)
-                {
-                    chars[cx, cy] = " ";
-                    fg[cx, cy]    = CurrentFG;
-                    bg[cx, cy]    = CurrentBG;
-                }
+            lock (_lock)
+            {
+                for (int cy = 0; cy < Height - lines; cy++)
+                    for (int cx = 0; cx < Width; cx++)
+                    {
+                        chars[cx, cy] = chars[cx, cy + lines];
+                        fg[cx, cy]    = fg[cx, cy + lines];
+                        bg[cx, cy]    = bg[cx, cy + lines];
+                    }
+                for (int cy = Height - lines; cy < Height; cy++)
+                    for (int cx = 0; cx < Width; cx++)
+                    {
+                        chars[cx, cy] = " ";
+                        fg[cx, cy]    = CurrentFG;
+                        bg[cx, cy]    = CurrentBG;
+                    }
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
